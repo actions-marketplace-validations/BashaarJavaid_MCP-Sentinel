@@ -1,449 +1,156 @@
-# MCP Sentinel
+# PortunusMCP Sentinel
+
+[![PyPI](https://img.shields.io/pypi/v/portunusmcp-sentinel)](https://pypi.org/project/portunusmcp-sentinel/)
+[![CI](https://github.com/BashaarJavaid/MCP-Sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/BashaarJavaid/MCP-Sentinel/actions/workflows/ci.yml)
+[![Documentation](https://github.com/BashaarJavaid/MCP-Sentinel/actions/workflows/docs.yml/badge.svg)](https://bashaarjavaid.github.io/MCP-Sentinel/)
 
 **Build-time security scanning for MCP servers.**
 
-AI agents invoke tools exposed by MCP servers, and a single unsafe tool can leak
-credentials, run arbitrary commands, or hijack the agent. MCP Sentinel catches
-those holes before you ship — it scans an MCP server and reports the security
-findings, each mapped to a known threat class.
+PortunusMCP Sentinel scans local MCP server source before deployment. It combines
+deterministic Python and TypeScript analysis, GPT-5.6 semantic review, optional
+Docker-isolated runtime probes, OWASP Agentic Top 10 mappings, and validated
+SARIF output for GitHub code scanning.
 
-It works in three layers: deterministic static rules find candidate issues,
-GPT-5.6 reviews each one in context to cut false positives and order and
-parameterize the probe plan, and a Docker-isolated sandbox runs the four probes
-to confirm exploitable or unsafe runtime behavior. Every finding maps to the
-OWASP Agentic Top 10 (the industry threat list for AI agents) and renders as
-console, JSON, or SARIF — the standard format GitHub reads for its security tab.
+The [1.4.0 release](https://github.com/BashaarJavaid/MCP-Sentinel/releases/tag/v1.4.0)
+includes the accepted Phase 22 coverage work and Phase 23 advisory regression.
+See the [roadmap](ROADMAP.md) for current project status and
+[maintenance guidance](docs/phase23-maintenance.md) for reporting issues.
 
-*Want the overview before running anything? Jump to [What it checks](#what-it-checks)
-and the [Architecture](#architecture) diagram.*
+## Install
 
-## Try Sentinel in three minutes
-
-No source checkout or OpenAI API key is required. Install from
-[PyPI](https://pypi.org/project/portunusmcp-sentinel/), then run the bundled GPT
-replay with real Docker probes.
-
-### 1. Install Sentinel
-
-Use Python 3.10, 3.11, 3.12, or 3.13 and install the exact release with pipx:
+Sentinel supports Python 3.10–3.13 on Linux, macOS, and Windows. Install the
+current package with [pipx](https://pipx.pypa.io/):
 
 ```bash
-pipx install portunusmcp-sentinel==1.0.0
+pipx install portunusmcp-sentinel
 ```
 
 Or use uv:
 
 ```bash
-uv tool install portunusmcp-sentinel==1.0.0
+uv tool install portunusmcp-sentinel
 ```
 
-### 2. Check Docker
+Rules-only commands below require **1.3.0 or newer**. Upgrade an existing install
+with `pipx upgrade portunusmcp-sentinel` or `uv tool upgrade portunusmcp-sentinel`.
 
-Start Docker Engine on Linux or Docker Desktop on macOS/Windows. Docker Desktop
-on Windows must use Linux containers.
+Reports expose observed handlers and recognition gaps, actual rule visits,
+per-session runtime catalogs and sent attacks, and separate static/dynamic review
+activity. Default findings include bounded evidence and repair guidance. Static
+surface totals remain unknown; zero findings are not proof of safety. See the
+[coverage and schema compatibility guide](docs/sarif.md#coverage-and-review-activity-native-160).
+Version 1.4.0 adds bounded imported handlers/schemas and containment flows;
+computed registrations and unresolved source forms remain coverage gaps.
+Permission sidecars express intended grants; they do not enforce runtime
+boundaries. Runtime campaigns schedule bounded rounds across discovered
+tools and supported fields (24 started attempts or 120 seconds by default).
+Native reports use schema 1.7.0; historical evidence retains its recorded versions.
+
+## Quickstart
+
+From a local Python or TypeScript MCP server repository:
 
 ```bash
-docker info
-docker buildx version
+sentinel scan . --rules-only
 ```
 
-The first run may download Docker images and fixture dependencies through
-Sentinel's restricted build network. The scanned server has no runtime network
-access.
+Rules-only needs no model credentials, review cache, network, Docker, target
+configuration, or target execution. It ignores inactive LLM settings even when
+credentials and endpoint overrides are present. Installation and dependency
+auditing need network access separately.
 
-### 3. Run the demo
+Deterministic static analysis has a shared 1,800-second limit (30 minutes),
+with a 120-second informational target. Fast scans return immediately;
+expiry remains an incomplete scan. Model review and dynamic budgets are separate.
+See the [timing policy](docs/phase22-timeout-policy.md) for measurement limits and
+the retained failures.
 
-macOS or Linux:
+Optionally run `sentinel init` afterward to generate a deny-by-default
+`sentinel.permissions.yaml`; review scopes before granting them. It never imports
+or executes source and needs no main guard or launch inference. Existing files
+require `--force` for replacement; symlinks are rejected.
 
-```bash
-sentinel --version
-sentinel demo --replay-review --verbose
-```
+For Python runtime scaffolding, run `sentinel init --dynamic`, then
+`sentinel scan . --no-rules-only`. Adding missing runtime configuration preserves
+and validates an existing permissions file. Dynamic scans require Docker,
+model credentials, source-context transmission, and model cost; dependency
+installation also needs network access. TypeScript does not support `--dynamic`.
+If generated arguments cannot complete a legitimate tool call, add known valid
+[`probe_baselines`](docs/configuration.md#dynamic-outcomes-and-valid-examples) to
+`sentinel.target.yaml`; an unsuccessful baseline leaves analysis incomplete.
 
-Windows PowerShell:
+Exit `0` and exit `1` both mean the scan completed: `0` means no finding reached
+the configured threshold, while `1` means at least one did. Exit `2` is a target
+or configuration error; exit `3` means analysis was incomplete.
 
-```powershell
-sentinel --version
-sentinel demo --replay-review --verbose
-```
+## Analysis tiers
 
-The demo should exit `0` with `Status: COMPLETE`, evaluate all seven static and
-four dynamic rules, and report `SENT-001` through `SENT-011`. It writes
-validated reports to:
+| Tier | Command | Requirements | Result |
+|---|---|---|---|
+| Rules-only | `sentinel scan . --rules-only` | None beyond Sentinel | Deterministic findings remain `needs_review` and fail-on eligible |
+| Static + GPT review | `sentinel scan . --static-only` | `OPENAI_API_KEY` | GPT reviews every selected deterministic candidate |
+| Full dynamic proof | `sentinel scan .` | `OPENAI_API_KEY`, Docker, and a Python target | GPT review plus four isolated runtime probes |
 
-```text
-sentinel-demo-results/report.json
-sentinel-demo-results/report.sarif
-```
+`--allow-degraded` permits unavailable review; it still calls the model when a
+key is available. Use `--rules-only` to disable review explicitly. Completion
+describes the selected analysis tier and does not prove a server is secure.
 
-Validate the SARIF independently on macOS or Linux:
+TypeScript support is static-only and covers `.ts`, `.mts`, and `.cts` sources
+using the official MCP SDK v1 and server v2 shapes. JavaScript, TSX, declaration
+files and Node execution are outside the supported boundary. Declared uv, npm
+and pnpm workspaces support aggregate static scans with root Sentinel settings.
+Bounded local imports, package exports and TypeScript source aliases feed
+containment and handler inventory. Other rules retain their documented flow
+limits. Dynamic targets are individual local Python 3.10–3.12 MCP packages.
 
-```bash
-python -m sentinel.report.validate_sarif sentinel-demo-results/report.sarif
-```
+Version 1.3.0 includes Phase 16 static-correctness changes: same-file
+named-helper execution flows and value-specific validation, authentication,
+integrity, and configured-sanitizer checks. Unsupported flows remain unresolved;
+see the [rule boundaries](docs/rules.md) and
+[verification record](docs/phase16-verification.md).
 
-On Windows PowerShell:
+Phase 17 source changes add validated dynamic baselines, explicit probe outcomes,
+and proof-preserving review in native JSON 1.6.0. The current replay bundle uses
+one approved runtime-review refresh and four unchanged static captures. See the
+[Phase 17 verification record](docs/phase17-verification.md) for gates and acceptance status.
 
-```powershell
-python -m sentinel.report.validate_sarif sentinel-demo-results\report.sarif
-```
+Version 1.4.0 emits native JSON 1.7.0 with ordered runtime attempts and workspace
+coverage. Historical reports and release evidence retain their recorded schema versions.
 
-The validator produces no output when the report is valid and exits `0`. Replay
-is prominently disclosed and makes no model call; checked responses captured
-from GPT-5.6 still pass through the production parser, evidence and probe-plan
-validators, all four real Docker probes, merge logic, and report validation.
+## Rules
 
-See the accepted live
-[`SENT-010` GitHub code-scanning alert](https://github.com/BashaarJavaid/mcp-sentinel-action-demo/security/code-scanning/10)
-and the complete [Action evidence](artifacts/phase4-action-evidence.md).
-
-## Scan your own server
-
-From the root of a local Python MCP server:
-
-```bash
-sentinel init
-# Review sentinel.permissions.yaml and grant only required scopes.
-sentinel scan .
-```
-
-`sentinel init` statically detects one guarded `FastMCP` or `Server` entry point,
-either a root `requirements.txt` or PEP 621 `project.dependencies`, the supported
-`mcp` or `fastmcp` package, and repository-wide tool declarations. It never
-imports or executes target code. Generated permissions are deny-all until you
-review them. Existing generated files are preserved unless you pass `--force`;
-even then, symbolic links and other non-regular destinations are refused.
-
-For an official TypeScript MCP SDK v1 or server v2 repository, onboarding writes
-only `sentinel.permissions.yaml` and preserves every target file:
-
-```bash
-sentinel init
-sentinel scan . --static-only
-```
-
-TypeScript support covers `.ts`, `.mts`, and `.cts`. JavaScript, TSX,
-declarations, workspaces, imported handlers/schemas, cross-file dataflow, and
-Node dynamic probing remain out of scope. Sentinel never runs Node, package
-scripts, or dependency installation during TypeScript analysis.
-
-Choose the analysis tier that matches your environment:
-
-| Tier | Command | Prerequisites |
-|---|---|---|
-| Rules-only degraded | `sentinel scan . --static-only --allow-degraded` | No Docker or paid GPT access |
-| Static plus GPT | `sentinel scan . --static-only` | `OPENAI_API_KEY`; no Docker |
-| Full dynamic proof | `sentinel scan .` | `OPENAI_API_KEY` and Docker |
-
-If a target has deterministic candidates but no API key, Sentinel explains how
-to set `OPENAI_API_KEY` or continue explicitly with `--allow-degraded`. Degraded
-candidates remain visible and count toward `--fail-on`.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    A[Untrusted MCP repository] --> B[AST + Semgrep rules]
-    B --> C[Canonical candidates]
-    C --> D[GPT-5.6 semantic review]
-    D --> E[Constrained four-probe plan]
-    E --> F[Docker sandbox]
-    F --> G[Reviewed dynamic evidence]
-    D --> H[Deduplication + provenance merge]
-    G --> H
-    H --> I[Console]
-    H --> J[JSON 1.3.0]
-    H --> K[SARIF 2.1.0]
-    K --> L[GitHub code scanning]
-```
-
-Static analysis never imports or executes target code. TypeScript analysis is
-static-only. Dynamic analysis runs
-only local Python MCP targets in fresh containers with read-only source,
-restricted build egress, no runtime network, resource limits, and forced
-cleanup. GPT can order and bind four permanent inert templates; it cannot emit
-executable probe code or create rule-less findings.
-
-## What it checks
-
-Each rule maps to a category in the OWASP Agentic Top 10; the `ASI0x:2026` codes
-are that list's threat identifiers (e.g. `ASI03` is Identity & Privilege Abuse).
+Every finding uses a stable rule ID and maps to the OWASP Agentic Top 10.
 
 | Rule | Detection | OWASP | Impact |
 |---|---|---|---|
-| SENT-001 | Overly broad tool permission scope | ASI03:2026 | High |
-| SENT-002 | Tool input reaches unsafe execution | ASI05:2026 | Critical |
-| SENT-003 | Missing tool input validation | ASI02:2026 | Medium |
-| SENT-004 | Unsanitized tool content enters a prompt | ASI01:2026 | High |
-| SENT-005 | Hardcoded credential | ASI03:2026 | Critical |
-| SENT-006 | Missing or ineffective route authentication | ASI03:2026 | High |
-| SENT-007 | Unverified tool manifest | ASI04:2026 | Medium |
-| SENT-008 | Out-of-scope tool execution | ASI02:2026 | Critical |
-| SENT-009 | Oversized argument accepted | ASI05:2026 | Medium |
-| SENT-010 | Injection payload executed | ASI05:2026 | Critical |
-| SENT-011 | Malformed schema input processed | ASI02:2026 | Low |
+| [SENT-001](docs/rules.md#sent-001) | Overly broad tool permission scope | ASI03:2026 | High |
+| [SENT-002](docs/rules.md#sent-002) | Tool input reaches unsafe execution | ASI05:2026 | Critical |
+| [SENT-003](docs/rules.md#sent-003) | Missing tool input validation | ASI02:2026 | Medium |
+| [SENT-004](docs/rules.md#sent-004) | Unsanitized tool content enters a prompt | ASI01:2026 | High |
+| [SENT-005](docs/rules.md#sent-005) | Hardcoded credential | ASI03:2026 | Critical |
+| [SENT-006](docs/rules.md#sent-006) | Missing or ineffective route authentication | ASI03:2026 | High |
+| [SENT-007](docs/rules.md#sent-007) | Unverified tool manifest | ASI04:2026 | Medium |
+| [SENT-008](docs/rules.md#sent-008) | Out-of-scope tool execution | ASI02:2026 | Critical |
+| [SENT-009](docs/rules.md#sent-009) | Size-limit breach or observed OOM/crash | ASI05:2026 | Medium |
+| [SENT-010](docs/rules.md#sent-010) | Injection payload executed | ASI05:2026 | Critical |
+| [SENT-011](docs/rules.md#sent-011) | Malformed schema input processed | ASI02:2026 | Low |
+| [SENT-012](docs/rules.md#sent-012) | Path containment failure | ASI02:2026 | High |
+| [SENT-013](docs/rules.md#sent-013) | Tool-description poisoning | ASI01:2026 | High |
+| [SENT-014](docs/rules.md#sent-014) | Command option injection | ASI05:2026 | Critical |
+| [SENT-015](docs/rules.md#sent-015) | Server-side request forgery | ASI02:2026 | High |
+| [SENT-016](docs/rules.md#sent-016) | Unauthorized operator-credential fallback | ASI03:2026 | High |
 
-Published `SENT-xxx` rule IDs are compatibility contracts. Existing IDs are
-never renumbered or reused for a different detection; changed meanings receive
-new IDs.
-
-See the [rule catalog](docs/rules.md) for boundaries, false-positive risks,
-evidence, and remediation.
-
-## Human, Codex, and GPT contribution
-
-The human owner defined product scope, architecture, trust boundaries, threat
-model, phase gates, and release decisions.
-
-### How Codex was used
-
-Codex was the implementation partner for the entire build. The working pattern
-was design-first: before any implementation, a long Codex session worked through
-scope and architecture — MVP versus deferred features, how findings map to OWASP
-categories, the allowed state transitions for a finding, and whether semantic
-review should be optional (it should not; a flag would have made it decorative).
-That session is the architectural backbone the rest of the project was built
-against.
-
-From there Codex built the static rule engine and Semgrep adapter, the Docker
-sandbox and probe harness, the reporting pipeline, the SARIF validator, the
-cross-platform test matrix, artifact automation, and the documentation. It also
-did the debugging on the harder cross-platform problems — Semgrep output parsing
-and runtime-file isolation on Windows, and the two rounds of SARIF fixes needed
-before GitHub code scanning would render the reports correctly.
-
-The repository ships an [`AGENTS.md`](AGENTS.md) that constrains how Codex works
-in this codebase: ask rather than assume, no speculative complexity, no
-unrelated edits, explicit success criteria. Design decisions stayed with the
-human owner; Codex accelerated everything downstream of them.
-
-### How GPT-5.6 was used
-
-GPT-5.6 is inside the shipped product, not just the build. It is load-bearing at
-scan time: it reads the server code, decides which static candidates are real
-findings, and orders and parameterizes the four probes the sandbox runs — turn it
-off and you get different results. It does not replace the deterministic
-detectors or the Docker boundary.
-
-The constraints are the design: strict Structured Outputs against a versioned
-schema, `store: false`, redacted and capped context, and host-validated source
-ranges, so the model cannot cite a line that does not exist, invent a finding
-outside the rule set, or emit executable probe code. See
-[GPT-5.6 behavior and disclosure](#gpt-56-behavior-and-disclosure) for the full
-runtime contract, and `artifacts/gpt-ablation.json` for a measured comparison of
-rules-only, GPT-reviewed, and dynamically confirmed outcomes.
-
-### Codex session record
-
-Primary Codex `/feedback` thread for core implementation:
-`019f70e6-a5fb-7f13-8eae-bca041fc37ad`.
-
-Supporting implementation threads:
-
-- `019f7469-e3ed-75a0-9906-7059299b1484`
-- `019f741f-cf91-7000-b12c-e9aa2a50ff03`
-- `019f77a1-f2f0-7ab2-9a5d-e72fa1ebc40e`
-
-The Phase 5 `/feedback` record was submitted from the primary thread above.
-
-## Requirements and installation
-
-Sentinel supports Python 3.10–3.13 on Linux, macOS, and Windows. Dynamically
-scanned Python targets remain limited to Python 3.10–3.12. Full scans and demos
-require Docker Engine or Docker Desktop with Buildx. The GitHub Action runs on
-Ubuntu.
-
-### Unreleased/source checkout
-
-Phase 10 endpoint configuration and Phase 11 TypeScript analysis are currently
-available from a source checkout,
-not from the released `1.0.0` package or Marketplace Action:
-
-```bash
-uv sync --extra dev
-uv run sentinel scan ./path/to/server
-```
-
-The pip-compatible development path is:
-
-```bash
-pip install -e ".[dev]"
-```
-
-Install the exact release from
-[PyPI](https://pypi.org/project/portunusmcp-sentinel/) with pipx:
-
-```bash
-pipx install portunusmcp-sentinel==1.0.0
-```
-
-Or use uv:
-
-```bash
-uv tool install portunusmcp-sentinel==1.0.0
-```
-
-### v1.0.0 release and Marketplace evidence
-
-The signed [`v1.0.0` GitHub Release](https://github.com/BashaarJavaid/MCP-Sentinel/releases/tag/v1.0.0)
-published the exact package through the trusted
-[release workflow](https://github.com/BashaarJavaid/MCP-Sentinel/actions/runs/33804931403).
-The [MCP Sentinel Marketplace listing](https://github.com/marketplace/actions/mcp-sentinel)
-is backed by the signed `v1` alias, and the paired
-[external Action proof](https://github.com/BashaarJavaid/mcp-sentinel-action-demo/actions/runs/33808213435)
-passed against that consumer reference. Package hashes, provenance, tag
-targets, retained SARIF, cost, and verification details are recorded in
-[`artifacts/phase8-marketplace-evidence.md`](artifacts/phase8-marketplace-evidence.md).
-
-### Historical v0.2.0 release evidence
-
-The signed-tag [Release workflow](https://github.com/BashaarJavaid/MCP-Sentinel/actions/runs/33795399096)
-published the tested wheel and sdist through OIDC to
-[TestPyPI](https://test.pypi.org/project/portunusmcp-sentinel/0.2.0/) and then
-[PyPI](https://pypi.org/project/portunusmcp-sentinel/0.2.0/). It verified both
-published hashes and attestations ([wheel](https://pypi.org/integrity/portunusmcp-sentinel/0.2.0/portunusmcp_sentinel-0.2.0-py3-none-any.whl/provenance),
-[sdist](https://pypi.org/integrity/portunusmcp-sentinel/0.2.0/portunusmcp_sentinel-0.2.0.tar.gz/provenance))
-and passed exact-version pipx and uv installs on Linux, macOS, and Windows with
-Python 3.10–3.13.
-
-### Historical v0.1.0 artifact
-
-The earlier [`v0.1.0` GitHub Release](https://github.com/BashaarJavaid/MCP-Sentinel/releases/tag/v0.1.0)
-contains `mcp_sentinel-0.1.0-py3-none-any.whl`, produced by the
-[successful release workflow](https://github.com/BashaarJavaid/MCP-Sentinel/actions/runs/29686427335).
-Its SHA-256 digest is
-`4672e63413e87bf750113c06a21133162d00f1e71ca6259a8394028c22b677aa`.
-
-To test a locally built 1.0.0 artifact without an index:
-
-```bash
-uv build
-pipx install dist/portunusmcp_sentinel-1.0.0-py3-none-any.whl
-# or
-uv tool install dist/portunusmcp_sentinel-1.0.0-py3-none-any.whl
-```
-
-## CLI
-
-```bash
-# Complete static + GPT + Docker analysis
-sentinel scan ./path/to/server
-
-# Validated SARIF
-sentinel scan ./path/to/server --format sarif --output results.sarif
-
-# Static analysis plus required semantic review
-sentinel scan ./path/to/server --static-only
-
-# Explicitly allow unreviewed candidates when GPT is unavailable
-sentinel scan ./path/to/server --static-only --allow-degraded
-
-# Compact output is default; bounded evidence is opt-in
-sentinel scan ./path/to/server --verbose
-
-# Set the failure threshold; default is high
-sentinel scan ./path/to/server --fail-on critical
-
-# Use a Responses-compatible organizational endpoint
-sentinel scan ./path/to/server \
-  --llm-model organization-deployment \
-  --llm-base-url https://llm.example/openai/v1
-```
-
-`--fail-on` accepts `critical`, `high`, `medium`, `low`, or `informational`, and
-determines which findings produce exit code `1`.
-
-`--color/--no-color` overrides display detection. Otherwise `NO_COLOR` disables
-style and interactive TTYs receive color. Presentation flags are rejected for
-JSON/SARIF rather than silently ignored.
-
-A normal scan requires `sentinel.target.yaml` and
-`sentinel.permissions.yaml`. `--static-only` omits Docker and launch
-configuration but still requires semantic review. `OPENAI_API_KEY` is read only
-by Sentinel; it is never printed, persisted, forwarded to the target, or stored
-by the Responses API.
-
-Model, reasoning effort, and base URL each use CLI → `SENTINEL_*` environment →
-target-root `sentinel.toml` → built-in-default precedence. Their CLI options are
-`--llm-model`, `--llm-reasoning-effort`, and `--llm-base-url`; the corresponding
-environment variables are `SENTINEL_LLM_MODEL`,
-`SENTINEL_LLM_REASONING_EFFORT`, and `SENTINEL_LLM_BASE_URL`. Public OpenAI
-accepts `gpt-5.6-sol` and the `gpt-5.6` alias with `low` or `medium` effort.
-
-Generic compatible endpoints must expose the Responses API below a `/v1` path.
-Azure OpenAI's v1 protocol shape is supported with a base URL ending in
-`/openai/v1`; it is covered by local emulation, not a live Azure deployment.
-Only `OPENAI_API_KEY` bearer authentication is supported. Legacy Azure routing,
-`api-version`, Microsoft Entra authentication, Azure-specific key variables,
-and custom headers are unsupported. `OPENAI_BASE_URL` and
-`OPENAI_CUSTOM_HEADERS` are rejected so Sentinel can validate routing and record
-endpoint provenance. HTTPS uses the native system certificate store and honors
-`SSL_CERT_FILE` and `SSL_CERT_DIR`.
-
-A compatible URL committed in `sentinel.toml` requires an operator to pass
-`--trust-llm-endpoint` or set `SENTINEL_TRUST_LLM_ENDPOINT=true`. A URL supplied
-directly by CLI or environment is already operator-controlled and needs no
-additional acknowledgment. Reports contain only endpoint mode and a SHA-256 URL
-hash; the compatible URL itself is never printed or serialized.
-
-Exit codes are stable:
-
-| Code | Meaning |
-|---:|---|
-| 0 | Complete scan with no finding at the failure threshold |
-| 1 | Complete scan with a finding at or above the threshold |
-| 2 | Target or configuration error |
-| 3 | GPT, Docker, Semgrep, report-validation, or internal failure |
-
-Operational messages use `target error:`, `configuration error:`, and
-`infrastructure error:` prefixes. `--debug` adds internal tracebacks.
-
-## Judge demo
-
-The wheel contains the vulnerable and clean fixtures, schemas, and GPT
-cassettes. No source checkout is required.
-
-```bash
-# Offline GPT replay plus real Docker probes
-sentinel demo --replay-review --verbose
-
-# Live GPT review plus real Docker probes
-export OPENAI_API_KEY=your-key
-sentinel demo --verbose
-```
-
-Both commands atomically refresh validated reports under
-`./sentinel-demo-results/`; use `--output-dir` to change the location. Expected
-vulnerabilities make the demo successful, so a complete demo exits `0`.
-Recorded review is prominently labeled and is never represented as a live call.
-See the [judge runbook and narration](docs/demo.md).
-
-## GPT-5.6 behavior and disclosure
-
-The production reviewer uses the Responses API with:
-
-- requested model `gpt-5.6-sol` and recorded returned model ID;
-- `store: false`;
-- medium reasoning effort by default;
-- strict Structured Outputs using the versioned review schema;
-- deterministic context selection, redaction, batching, and candidate caps;
-- validated source-range claims and constrained probe plans;
-- current/origin latency, tokens, cache, failure, and micro-USD telemetry.
-
-Public OpenAI cost estimates use the documented GPT-5.6 Sol rates as of
-2026-09-03: $4/M input, $0.40/M cached input, and $20/M output, with cache writes
-at 1.25× input. Compatible endpoints retain token usage but report pricing and
-cost as unavailable.
-
-Live mode calls the model. Replay mode feeds checked live responses through the
-same parser, validators, merge logic, dynamic probes, and reports. Degraded mode
-is explicit, leaves candidates in `needs_review`, and remains fail-on eligible.
-Suppressed candidates stay visible in every report with their reasoning.
+Published IDs are compatibility contracts: an ID is never renumbered or reused
+for a different detection. The [rule catalog](docs/rules.md) documents each
+engine, boundary, false-positive risk, evidence, and remediation.
 
 ## GitHub Action
 
+The Marketplace Action runs the full Python pipeline, validates SARIF before
+upload, and preserves Sentinel's exit contract.
+
 ```yaml
-name: MCP Sentinel
+name: PortunusMCP Sentinel
 
 on:
   pull_request:
@@ -455,10 +162,10 @@ permissions:
   security-events: write
 
 jobs:
-  scan:
+  sentinel:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - id: sentinel
         uses: BashaarJavaid/MCP-Sentinel@v1
         with:
@@ -467,45 +174,130 @@ jobs:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
 ```
 
-The Action validates SARIF before upload and exposes `sarif-path`,
-`findings-count`, and `highest-severity`. Fork pull requests receive no secret;
-they run visibly degraded analysis and skip code-scanning upload. Non-fork runs
-remain fail-closed. The current `v1` live proof is documented in
-[`artifacts/phase8-marketplace-evidence.md`](artifacts/phase8-marketplace-evidence.md);
-the earlier commit-pinned proof remains in
-[`artifacts/phase4-action-evidence.md`](artifacts/phase4-action-evidence.md).
-The Marketplace Action remains pinned to released Sentinel `1.0.0`; it does not
-expose the unreleased source-checkout endpoint options or TypeScript support.
+The Action exposes `sarif-path`, `findings-count`, and `highest-severity`.
+Forked pull requests, where secrets are withheld, run visibly degraded analysis
+and skip upload. High-assurance consumers can replace `@v1` with the immutable
+commit SHA for the selected release.
 
-`v1` follows the latest compatible `v1.x.y` Action release. Security-sensitive
-workflows can replace it with that release's full commit SHA. Maintainers move
-only the signed major-version alias after the exact release passes its gates:
+## Architecture
 
-```bash
-git tag -s -a -f v1 v1.0.0 -m "MCP Sentinel Action v1.0.0"
-git push --force origin refs/tags/v1
+```mermaid
+flowchart LR
+    A[Untrusted MCP repository] --> B[AST + Semgrep rules]
+    B --> C[Canonical candidates]
+    C --> D[GPT-5.6 semantic review]
+    D --> E[Bounded ordered probe attempts]
+    E --> F[Docker sandbox]
+    F --> G[Reviewed dynamic evidence]
+    D --> H[Deduplication + provenance merge]
+    G --> H
+    H --> I[Console]
+    H --> J[JSON 1.7.0]
+    H --> K[SARIF 2.1.0]
+    K --> L[GitHub code scanning]
 ```
 
-## Reports and reproducibility
+Static analysis never imports or executes target code. GPT receives bounded,
+redacted context and can only review existing candidates or order four permanent
+inert probes. Dynamic analysis mounts local Python source read-only in fresh
+containers with no runtime network, resource limits, and forced cleanup. All
+stages feed one canonical Finding model consumed by console, JSON, and SARIF.
+
+PortunusMCP Sentinel is the build-time plane of the PortunusMCP family. The
+[PortunusMCP Gateway](https://github.com/BashaarJavaid/PortunusMCP) provides
+runtime enforcement in a separate repository, while PortunusMCP Identity is the
+separate short-lived credential-broker plane. Neither is required by Sentinel.
+
+## Configuration and adoption
+
+Configuration precedence is CLI → `SENTINEL_*` environment → target-root
+`sentinel.toml` → built-in defaults. A normal full scan also requires
+`sentinel.target.yaml` and `sentinel.permissions.yaml`; `--static-only` does not
+require launch configuration.
+
+Create a baseline from a complete native JSON report, then compare later scans:
+
+```bash
+sentinel scan . --allow-degraded --format json --output sentinel-baseline.json
+sentinel scan . --allow-degraded --baseline sentinel-baseline.json
+```
+
+Matched findings remain visible but do not affect `--fail-on`. Sentinel never
+updates a baseline automatically.
+
+Suppress a reviewed static source finding with a reason-bearing directive:
+
+```python
+# sentinel: ignore[SENT-005] reason=test credential is inert and rotated
+api_key = "ghp_example"
+```
+
+Only static `SENT-001`–`SENT-007` and `SENT-012`–`SENT-016` findings can be suppressed. Applied
+suppressions remain visible in every report; malformed, duplicate, unknown-rule,
+or reasonless directives fail configuration validation.
+
+Use Sentinel from pre-commit:
+
+```yaml
+repos:
+  - repo: https://github.com/BashaarJavaid/MCP-Sentinel
+    rev: v1.4.0
+    hooks:
+      - id: mcp-sentinel
+```
+
+See the [configuration guide](https://bashaarjavaid.github.io/MCP-Sentinel/configuration/)
+for LLM endpoint trust, rule selection, baselines, suppressions, and pre-commit.
+
+## CLI and report reference
+
+```bash
+# Full static, GPT, and Docker analysis
+sentinel scan ./path/to/server
+
+# Static analysis with required GPT review
+sentinel scan ./path/to/server --static-only
+
+# Validated SARIF
+sentinel scan ./path/to/server --format sarif --output results.sarif
+
+# Select rules and change the failure threshold
+sentinel scan ./path/to/server --rules SENT-001,SENT-005 --fail-on critical
+
+# Exercise the packaged reference pipeline
+sentinel demo --replay-review --verbose
+```
+
+`--fail-on` accepts `critical`, `high`, `medium`, `low`, or `informational`.
+Console output is the default; `--format json` and `--format sarif` are stable
+machine-readable paths. Validate reports offline with:
 
 ```bash
 python -m sentinel.schema check
 python -m sentinel.report.validate_sarif results.sarif
-make artifacts-check
-make notices-check
 ```
 
-`artifacts/example.sarif` is retained as historical live schema-1.2 evidence.
-`artifacts/gpt-ablation.json` compares rules-only, GPT-reviewed, and
-dynamically confirmed outcomes over the versioned truth set. Routine generation
-uses replay and Docker; the final live refresh is hard-capped:
+The production reviewer uses GPT-5.6 Sol through the Responses API with
+`store: false`, medium reasoning effort, strict Structured Outputs, bounded
+context, and host-validated evidence. Sentinel's public OpenAI cost calculation
+uses the rates recorded on 2026-09-04: $4/M input, $0.40/M cached input, and
+$20/M output, with cache writes at 1.25× input. See the official
+[GPT-5.6 Sol model and pricing page](https://developers.openai.com/api/docs/models/gpt-5.6-sol)
+and [Responses API create reference](https://developers.openai.com/api/reference/cli/resources/responses/methods/create).
+Compatible endpoints retain token usage but report pricing as unavailable.
 
-```bash
-make artifacts
-MAX_USD=0.50 make artifacts-live
-```
+## Project resources
 
-## License
+- [Scan a real MCP server before release](https://bashaarjavaid.github.io/MCP-Sentinel/walkthrough/)
+- [Marketplace Action](https://github.com/marketplace/actions/mcp-sentinel)
+- [Documentation](https://bashaarjavaid.github.io/MCP-Sentinel/)
+- [Architecture contract](ARCHITECTURE.md)
+- [Roadmap](ROADMAP.md)
+- [Contributing](CONTRIBUTING.md)
+- [SARIF guide](https://bashaarjavaid.github.io/MCP-Sentinel/sarif/)
+- [Changelog](CHANGELOG.md)
+- [Security policy](SECURITY.md)
+- [Project history](docs/hackathon.md)
 
-MCP Sentinel is MIT licensed. Dependency licenses and packaged notice files are
-recorded in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+PortunusMCP Sentinel is MIT licensed. Dependency licenses and packaged notices
+are recorded in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

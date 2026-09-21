@@ -35,6 +35,7 @@ from sentinel.finding import (
     ReviewStatus,
     SourceRange,
     TokenUsage,
+    runtime_evidence,
 )
 from sentinel.llm.cache import ReviewCache
 from sentinel.llm.context import FindingContext, build_finding_context, sanitize_text
@@ -54,7 +55,7 @@ DEFAULT_PROBE_ORDER = ("SENT-008", "SENT-009", "SENT-010", "SENT-011")
 PRICING = GptPricing(
     model=MODEL,
     source="https://developers.openai.com/api/docs/models/gpt-5.6-sol",
-    as_of="2026-09-03",
+    as_of="2026-09-04",
     input_micro_usd_per_million=4_000_000,
     cached_input_micro_usd_per_million=400_000,
     output_micro_usd_per_million=20_000_000,
@@ -166,8 +167,8 @@ def unavailable_review_outcome(
             "candidates visible and fail-on eligible."
             if allow_degraded
             else "OPENAI_API_KEY is not set; set it for GPT review or rerun with "
-            "--allow-degraded to keep rules-only candidates visible and fail-on "
-            "eligible."
+            "--rules-only for offline static analysis. Use --allow-degraded to "
+            "permit unavailable review while keeping candidates fail-on eligible."
         )
     updated = (
         tuple(_degrade(item, reason, applied_at) for item in findings)
@@ -205,7 +206,7 @@ def empty_review_outcome(config: LlmConfig, *, mode: str) -> ReviewOutcome:
         cache_writes=0,
         cache_errors=0,
     )
-    summary = summary.model_copy(update={"mode": mode})
+    summary = summary.model_copy(update={"mode": "not_run"})
     return ReviewOutcome((), (), summary, fatal=False)
 
 
@@ -623,6 +624,11 @@ def _request(
                 "tool_id": tool_id,
             }
         )
+        if candidate.context.omitted_flow_locations:
+            items[-1]["omitted_flow_locations"] = [
+                item.model_dump(mode="json")
+                for item in candidate.context.omitted_flow_locations
+            ]
     untrusted = json.dumps(
         {
             "untrusted_repository_data": {
@@ -821,11 +827,8 @@ def _validate_probe_plan(
                 )
         elif value != expected:
             raise _ReviewFailure(f"invalid {probe_id} binding", retryable=True)
-        field_schema = properties[field]
-        field_type = (
-            field_schema.get("type") if isinstance(field_schema, dict) else None
-        )
-        if probe_id == "SENT-009" and field_type not in {
+        field_types = _probe_field_types(properties[field])
+        if probe_id == "SENT-009" and not field_types & {
             "string",
             "array",
             "object",
@@ -834,17 +837,33 @@ def _validate_probe_plan(
                 "oversized probe requires a string or container field",
                 retryable=True,
             )
-        if probe_id == "SENT-010" and field_type != "string":
+        if probe_id == "SENT-010" and "string" not in field_types:
             raise _ReviewFailure(
                 "injection probe requires a string field", retryable=True
             )
 
 
+def _probe_field_types(schema: object) -> set[str]:
+    """Read declared primitive types, including the extractor's anyOf unions."""
+    if not isinstance(schema, dict):
+        return set()
+    declared = schema.get("type")
+    if isinstance(declared, str):
+        return {declared}
+    if isinstance(declared, list):
+        return {kind for kind in declared if isinstance(kind, str)}
+    alternatives = schema.get("anyOf")
+    kinds: set[str] = set()
+    if isinstance(alternatives, list):
+        for alternative in alternatives:
+            kinds.update(_probe_field_types(alternative))
+    return kinds
+
+
 def _probe_schema_eligible(tool: ToolMetadata) -> bool:
     properties = tool.input_schema.get("properties")
     return isinstance(properties, dict) and any(
-        isinstance(schema, dict) and schema.get("type") == "string"
-        for schema in properties.values()
+        "string" in _probe_field_types(schema) for schema in properties.values()
     )
 
 
@@ -918,7 +937,11 @@ def _merge_decision(
         if decision.confidence >= 0.5
         else Confidence.LOW
     )
-    data = finding.model_dump(mode="python", exclude={"severity"})
+    if runtime_evidence(finding):
+        status = FindingStatus.CONFIRMED
+        exploitability = Exploitability.CONFIRMED
+        confidence = Confidence.HIGH
+    data = finding.model_dump(mode="python", exclude={"severity", "review_disagrees"})
     data.update(
         status=status,
         exploitability=exploitability,
@@ -929,7 +952,7 @@ def _merge_decision(
 
 
 def _degrade(finding: Finding, reason: str, applied_at: datetime) -> Finding:
-    data = finding.model_dump(mode="python", exclude={"severity"})
+    data = finding.model_dump(mode="python", exclude={"severity", "review_disagrees"})
     data.update(
         status=FindingStatus.NEEDS_REVIEW,
         exploitability=(
@@ -939,6 +962,12 @@ def _degrade(finding: Finding, reason: str, applied_at: datetime) -> Finding:
         ),
         review=DegradedReview(reason=sanitize_text(reason), applied_at=applied_at),
     )
+    if runtime_evidence(finding):
+        data.update(
+            status=FindingStatus.CONFIRMED,
+            exploitability=Exploitability.CONFIRMED,
+            confidence=Confidence.HIGH,
+        )
     return Finding.model_validate(data)
 
 
@@ -1124,7 +1153,7 @@ def _failed_batch_record(
         origin_latency_ms=0,
         current_cost_micro_usd=0 if _pricing(config) is not None else None,
         origin_cost_micro_usd=0 if _pricing(config) is not None else None,
-        needs_review_count=len(batch.candidates),
+        needs_review_count=0,
     )
 
 
@@ -1142,9 +1171,9 @@ def _summarize_review(
     cache_errors: int,
 ) -> GptReviewSummary:
     modes = {item.mode for item in records}
-    mode = next(iter(modes)) if len(modes) == 1 else "mixed"
+    mode: str = next(iter(modes)) if len(modes) == 1 else "mixed"
     if not modes:
-        mode = "degraded"
+        mode = "degraded" if candidate_count else "not_run"
     current_usage = _add_usage(tuple(item.current_usage for item in records))
     origin_usage = _add_usage(tuple(item.origin_usage for item in records))
     return GptReviewSummary(
@@ -1156,12 +1185,34 @@ def _summarize_review(
         candidate_count=candidate_count,
         selected_count=selected_count,
         overflow_count=overflow_count,
-        reviewed_count=sum(finding.review.reviewed for finding in findings),
-        confirmed_count=sum(f.status is FindingStatus.CONFIRMED for f in findings),
-        suppressed_count=sum(f.status is FindingStatus.SUPPRESSED for f in findings),
-        needs_review_count=sum(
-            f.status is FindingStatus.NEEDS_REVIEW for f in findings
+        reviewed_count=sum(
+            bool(finding.review and finding.review.reviewed) for finding in findings
         ),
+        confirmed_count=sum(
+            bool(
+                f.review
+                and f.review.reviewed
+                and f.review.status is ReviewStatus.CONFIRMED
+            )
+            for f in findings
+        ),
+        suppressed_count=sum(
+            bool(
+                f.review
+                and f.review.reviewed
+                and f.review.status is ReviewStatus.SUPPRESSED
+            )
+            for f in findings
+        ),
+        needs_review_count=sum(
+            bool(
+                f.review
+                and f.review.reviewed
+                and f.review.status is ReviewStatus.NEEDS_REVIEW
+            )
+            for f in findings
+        ),
+        disagreement_count=sum(f.review_disagrees for f in findings),
         failure_count=sum(item.status == "failed" for item in records),
         cache_hits=cache_hits,
         cache_misses=cache_misses,

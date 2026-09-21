@@ -36,6 +36,8 @@ class ActionInputs:
     target_path: str
     fail_on: str
     static_only: str
+    baseline: str = ""
+    rules_only: str = ""
 
 
 @dataclass(frozen=True)
@@ -44,6 +46,8 @@ class SarifMetrics:
     highest_severity: str
     analysis_complete: bool
     review: dict[str, Any] | None
+    baseline: dict[str, Any] | None = None
+    rules_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -73,8 +77,12 @@ def execute_action(
 
     try:
         target, relative_target = resolve_target(workspace, inputs.target_path)
+        baseline = resolve_baseline(workspace, inputs.baseline)
         fail_on = _fail_on(inputs.fail_on)
         static_only = _boolean(inputs.static_only, "static-only")
+        rules_only = (
+            _boolean(inputs.rules_only, "rules-only") if inputs.rules_only else None
+        )
         fork = is_fork_pull_request(environ)
     except ActionUsageError as error:
         return ActionResult(
@@ -104,8 +112,12 @@ def execute_action(
         "--fail-on",
         fail_on,
     ]
+    if rules_only is not None:
+        command.append("--rules-only" if rules_only else "--no-rules-only")
     if static_only:
         command.append("--static-only")
+    if baseline is not None:
+        command.extend(("--baseline", str(baseline)))
     if fork:
         command.append("--allow-degraded")
 
@@ -190,6 +202,34 @@ def resolve_target(workspace: Path, value: str) -> tuple[Path, Path]:
     return resolved, relative
 
 
+def resolve_baseline(workspace: Path, value: str) -> Path | None:
+    """Resolve a non-symlink baseline file within GITHUB_WORKSPACE."""
+
+    if not value:
+        return None
+    if any(ord(character) < 32 for character in value):
+        raise ActionUsageError("baseline must be a printable path")
+    candidate = Path(value)
+    if candidate.is_absolute():
+        raise ActionUsageError("baseline must be relative to GITHUB_WORKSPACE")
+    lexical = workspace / candidate
+    cursor = workspace
+    for part in candidate.parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ActionUsageError("baseline cannot contain symlinks")
+    try:
+        resolved = lexical.resolve(strict=True)
+        resolved.relative_to(workspace)
+    except (OSError, ValueError) as error:
+        raise ActionUsageError(
+            "baseline does not identify a file in GITHUB_WORKSPACE"
+        ) from error
+    if not resolved.is_file():
+        raise ActionUsageError("baseline must identify a regular file")
+    return resolved
+
+
 def is_fork_pull_request(environ: Mapping[str, str]) -> bool:
     """Return whether the current pull_request event originates from a fork."""
 
@@ -227,6 +267,7 @@ def analyze_sarif(payload: Any) -> SarifMetrics:
         analysis_complete = invocation_properties["analysisComplete"]
         driver_properties = run["tool"]["driver"].get("properties", {})
         review = driver_properties.get("gptReview")
+        baseline = invocation_properties.get("baseline")
     except (KeyError, IndexError, TypeError) as error:
         raise ActionUsageError("SARIF lacks Sentinel summary properties") from error
     if not isinstance(results, list) or not isinstance(declared_count, int):
@@ -237,6 +278,8 @@ def analyze_sarif(payload: Any) -> SarifMetrics:
         raise ActionUsageError("SARIF analysis state is invalid")
     if review is not None and not isinstance(review, dict):
         raise ActionUsageError("SARIF GPT review summary is invalid")
+    if baseline is not None and not isinstance(baseline, dict):
+        raise ActionUsageError("SARIF baseline summary is invalid")
 
     severities: list[str] = []
     for result in results:
@@ -247,6 +290,8 @@ def analyze_sarif(payload: Any) -> SarifMetrics:
             raise ActionUsageError("SARIF result properties are invalid")
         if properties.get("status") == "suppressed":
             continue
+        if properties.get("baselineMatched") is True:
+            continue
         raw_severity = properties.get("severity")
         if not isinstance(raw_severity, str):
             raise ActionUsageError("SARIF result severity is missing")
@@ -255,7 +300,17 @@ def analyze_sarif(payload: Any) -> SarifMetrics:
             raise ActionUsageError(f"SARIF result severity is invalid: {raw_severity}")
         severities.append(severity)
     highest = max(severities, key=_SEVERITY_RANK.__getitem__) if severities else "none"
-    return SarifMetrics(declared_count, highest, analysis_complete, review)
+    stages = invocation_properties.get("stages", [])
+    rules_only = isinstance(stages, list) and any(
+        isinstance(stage, dict)
+        and stage.get("name") == "gpt_static"
+        and stage.get("status") == "skipped"
+        and stage.get("reason") == "rules-only scan requested"
+        for stage in stages
+    )
+    return SarifMetrics(
+        declared_count, highest, analysis_complete, review, baseline, rules_only
+    )
 
 
 def render_step_summary(result: ActionResult) -> str:
@@ -282,7 +337,7 @@ def render_step_summary(result: ActionResult) -> str:
     cache_fields = ("cache_hits", "cache_misses", "cache_writes", "cache_errors")
 
     lines = [
-        "## MCP Sentinel",
+        "## PortunusMCP Sentinel",
         "",
         "| Field | Value |",
         "| --- | --- |",
@@ -320,12 +375,50 @@ def render_step_summary(result: ActionResult) -> str:
         )
         + " |",
     ]
-    if result.fork_pull_request:
+    if result.metrics.rules_only:
+        lines = lines[: lines.index("### GPT review")]
+        lines.extend(
+            (
+                "Tier: **RULES-ONLY**. GPT review and dynamic probes skipped.",
+                "Completion applies to the selected tier; it is not proof of security.",
+                "SARIF upload is a separate network operation.",
+            )
+        )
+    if result.fork_pull_request and result.metrics.rules_only:
+        lines.extend(
+            (
+                "",
+                "> Fork pull request: GPT credentials were withheld and "
+                "code-scanning upload was skipped.",
+            )
+        )
+    elif result.fork_pull_request:
         lines.extend(
             (
                 "",
                 "> Fork pull request: GPT credentials were withheld, degraded "
                 "review was enabled, and code-scanning upload was skipped.",
+            )
+        )
+    baseline = result.metrics.baseline
+    if baseline is not None:
+        source_hash = str(baseline.get("source_sha256", ""))[:12]
+        lines.extend(
+            (
+                "",
+                "### Baseline",
+                "",
+                "| Field | Value |",
+                "| --- | --- |",
+                f"| Matcher | {_markdown(str(baseline.get('matcher_version', '')))} |",
+                "| Source schema | "
+                f"{_markdown(str(baseline.get('source_schema_version', '')))} |",
+                f"| Source SHA-256 | `{_markdown(source_hash)}` |",
+                f"| Prior / matched / new / resolved | "
+                f"{_integer(baseline.get('baseline_finding_count'))} / "
+                f"{_integer(baseline.get('matched_finding_count'))} / "
+                f"{_integer(baseline.get('new_finding_count'))} / "
+                f"{_integer(baseline.get('resolved_finding_count'))} |",
             )
         )
     if result.message:
@@ -362,11 +455,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--target-path", default=".")
     parser.add_argument("--fail-on", default="high")
     parser.add_argument("--static-only", default="false")
+    parser.add_argument("--baseline", default="")
+    parser.add_argument("--rules-only", default="")
     args = parser.parse_args(argv)
     environ = dict(os.environ)
     try:
         result = execute_action(
-            ActionInputs(args.target_path, args.fail_on, args.static_only), environ
+            ActionInputs(
+                args.target_path,
+                args.fail_on,
+                args.static_only,
+                args.baseline,
+                args.rules_only,
+            ),
+            environ,
         )
         emit_action_state(result, environ)
     except Exception as error:  # final infrastructure boundary for the Action helper

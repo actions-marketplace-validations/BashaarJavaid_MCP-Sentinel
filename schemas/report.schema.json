@@ -1,5 +1,65 @@
 {
   "$defs": {
+    "BaselineSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "baseline_finding_count": {
+          "minimum": 0,
+          "title": "Baseline Finding Count",
+          "type": "integer"
+        },
+        "matched_finding_count": {
+          "minimum": 0,
+          "title": "Matched Finding Count",
+          "type": "integer"
+        },
+        "matcher_version": {
+          "default": "sentinel-baseline-v2",
+          "enum": [
+            "sentinel-baseline-v1",
+            "sentinel-baseline-v2"
+          ],
+          "title": "Matcher Version",
+          "type": "string"
+        },
+        "new_finding_count": {
+          "minimum": 0,
+          "title": "New Finding Count",
+          "type": "integer"
+        },
+        "resolved_finding_count": {
+          "minimum": 0,
+          "title": "Resolved Finding Count",
+          "type": "integer"
+        },
+        "source_schema_version": {
+          "enum": [
+            "1.3.0",
+            "1.4.0",
+            "1.5.0",
+            "1.6.0",
+            "1.7.0"
+          ],
+          "title": "Source Schema Version",
+          "type": "string"
+        },
+        "source_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "title": "Source Sha256",
+          "type": "string"
+        }
+      },
+      "required": [
+        "source_schema_version",
+        "source_sha256",
+        "baseline_finding_count",
+        "matched_finding_count",
+        "new_finding_count",
+        "resolved_finding_count"
+      ],
+      "title": "BaselineSummary",
+      "type": "object"
+    },
     "CachedReview": {
       "additionalProperties": false,
       "properties": {
@@ -145,6 +205,73 @@
         "endpoint_url_hash"
       ],
       "title": "CachedReview",
+      "type": "object"
+    },
+    "CampaignCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "budget_exhausted": {
+          "title": "Budget Exhausted",
+          "type": "boolean"
+        },
+        "elapsed_ms": {
+          "minimum": 0,
+          "title": "Elapsed Ms",
+          "type": "number"
+        },
+        "eligible_attempts": {
+          "minimum": 0,
+          "title": "Eligible Attempts",
+          "type": "integer"
+        },
+        "enumeration_complete": {
+          "title": "Enumeration Complete",
+          "type": "boolean"
+        },
+        "max_probe_attempts": {
+          "minimum": 1,
+          "title": "Max Probe Attempts",
+          "type": "integer"
+        },
+        "planned_attempts": {
+          "minimum": 0,
+          "title": "Planned Attempts",
+          "type": "integer"
+        },
+        "remaining_eligible_attempts": {
+          "minimum": 0,
+          "title": "Remaining Eligible Attempts",
+          "type": "integer"
+        },
+        "started_attempts": {
+          "minimum": 0,
+          "title": "Started Attempts",
+          "type": "integer"
+        },
+        "tested_attempts": {
+          "minimum": 0,
+          "title": "Tested Attempts",
+          "type": "integer"
+        },
+        "timeout_seconds": {
+          "minimum": 1,
+          "title": "Timeout Seconds",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "max_probe_attempts",
+        "timeout_seconds",
+        "planned_attempts",
+        "eligible_attempts",
+        "started_attempts",
+        "tested_attempts",
+        "remaining_eligible_attempts",
+        "enumeration_complete",
+        "budget_exhausted",
+        "elapsed_ms"
+      ],
+      "title": "CampaignCoverage",
       "type": "object"
     },
     "Confidence": {
@@ -335,9 +462,166 @@
       "title": "DegradedReview",
       "type": "object"
     },
+    "DiscoverySnapshot": {
+      "additionalProperties": false,
+      "properties": {
+        "attempt_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt Id"
+        },
+        "more_pages": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "More Pages"
+        },
+        "probe_id": {
+          "title": "Probe Id",
+          "type": "string"
+        },
+        "reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Reason"
+        },
+        "role": {
+          "enum": [
+            "discovery",
+            "baseline",
+            "attack"
+          ],
+          "title": "Role",
+          "type": "string"
+        },
+        "tool_total": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool Total"
+        },
+        "tools": {
+          "items": {
+            "$ref": "#/$defs/ObservedTool"
+          },
+          "title": "Tools",
+          "type": "array"
+        }
+      },
+      "required": [
+        "probe_id",
+        "role",
+        "tools",
+        "more_pages",
+        "tool_total"
+      ],
+      "title": "DiscoverySnapshot",
+      "type": "object"
+    },
+    "DynamicAnalysisSummary": {
+      "additionalProperties": false,
+      "properties": {
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DynamicCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "probe_outcomes": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/DynamicProbeOutcome"
+          },
+          "title": "Probe Outcomes",
+          "type": "array"
+        }
+      },
+      "title": "DynamicAnalysisSummary",
+      "type": "object"
+    },
+    "DynamicCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "campaign": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CampaignCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "discovery": {
+          "items": {
+            "$ref": "#/$defs/DiscoverySnapshot"
+          },
+          "title": "Discovery",
+          "type": "array"
+        },
+        "planned_bindings": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/PlannedProbeBinding"
+          },
+          "title": "Planned Bindings",
+          "type": "array"
+        }
+      },
+      "required": [
+        "discovery"
+      ],
+      "title": "DynamicCoverage",
+      "type": "object"
+    },
     "DynamicEvidence": {
       "additionalProperties": false,
       "properties": {
+        "attempt_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt Id"
+        },
         "kind": {
           "const": "dynamic",
           "default": "dynamic",
@@ -352,10 +636,34 @@
           "title": "Logs",
           "type": "array"
         },
+        "mutation": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mutation"
+        },
         "probe_id": {
           "minLength": 1,
           "title": "Probe Id",
           "type": "string"
+        },
+        "proof": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RuntimeProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
         },
         "request": {
           "additionalProperties": {
@@ -378,6 +686,206 @@
         "response"
       ],
       "title": "DynamicEvidence",
+      "type": "object"
+    },
+    "DynamicProbeOutcome": {
+      "additionalProperties": false,
+      "properties": {
+        "argument_path": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Argument Path",
+          "type": "array"
+        },
+        "attack": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Attack",
+          "type": "object"
+        },
+        "attack_attempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attack Attempted"
+        },
+        "attempt_id": {
+          "minLength": 1,
+          "title": "Attempt Id",
+          "type": "string"
+        },
+        "baseline": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Baseline",
+          "type": "object"
+        },
+        "baseline_attempted": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Baseline Attempted"
+        },
+        "effects": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Effects",
+          "type": "object"
+        },
+        "eligible": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Eligible"
+        },
+        "execution_successful": {
+          "default": true,
+          "title": "Execution Successful",
+          "type": "boolean"
+        },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Field"
+        },
+        "legacy_attempt": {
+          "default": false,
+          "title": "Legacy Attempt",
+          "type": "boolean"
+        },
+        "mutation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mutation"
+        },
+        "probe_id": {
+          "enum": [
+            "SENT-008",
+            "SENT-009",
+            "SENT-010",
+            "SENT-011"
+          ],
+          "title": "Probe Id",
+          "type": "string"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "schema_checks": {
+          "default": [],
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
+          },
+          "title": "Schema Checks",
+          "type": "array"
+        },
+        "started": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Started"
+        },
+        "status": {
+          "enum": [
+            "tested",
+            "unsupported",
+            "untested",
+            "inconclusive"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "timings": {
+          "additionalProperties": {
+            "type": "number"
+          },
+          "title": "Timings",
+          "type": "object"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool"
+        },
+        "verdict": {
+          "anyOf": [
+            {
+              "enum": [
+                "violation_observed",
+                "no_violation_observed"
+              ],
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Verdict"
+        }
+      },
+      "required": [
+        "attempt_id",
+        "probe_id",
+        "status",
+        "verdict",
+        "tool",
+        "field",
+        "reason"
+      ],
+      "title": "DynamicProbeOutcome",
       "type": "object"
     },
     "EndpointMode": {
@@ -756,6 +1264,19 @@
         "current_usage": {
           "$ref": "#/$defs/TokenUsage"
         },
+        "disagreement_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": 0,
+          "title": "Disagreement Count"
+        },
         "endpoint_mode": {
           "$ref": "#/$defs/EndpointMode"
         },
@@ -775,7 +1296,8 @@
             "replay",
             "cached",
             "degraded",
-            "mixed"
+            "mixed",
+            "not_run"
           ],
           "title": "Mode",
           "type": "string"
@@ -883,6 +1405,38 @@
       ],
       "title": "Impact",
       "type": "string"
+    },
+    "InlineSuppression": {
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "const": "inline",
+          "default": "inline",
+          "title": "Kind",
+          "type": "string"
+        },
+        "line": {
+          "minimum": 1,
+          "title": "Line",
+          "type": "integer"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "reason": {
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason",
+        "path",
+        "line"
+      ],
+      "title": "InlineSuppression",
+      "type": "object"
     },
     "JsonValue": {},
     "LiveReview": {
@@ -1240,6 +1794,52 @@
       "title": "NotReviewedReview",
       "type": "object"
     },
+    "ObservedTool": {
+      "additionalProperties": false,
+      "properties": {
+        "field_paths": {
+          "items": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": "Field Paths",
+          "type": "array"
+        },
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "schema_sha256": {
+          "anyOf": [
+            {
+              "pattern": "^[0-9a-f]{64}$",
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Schema Sha256"
+        },
+        "unresolved": {
+          "items": {
+            "$ref": "#/$defs/UnresolvedFieldSpace"
+          },
+          "title": "Unresolved",
+          "type": "array"
+        }
+      },
+      "required": [
+        "name",
+        "schema_sha256",
+        "field_paths",
+        "unresolved"
+      ],
+      "title": "ObservedTool",
+      "type": "object"
+    },
     "OwaspCategory": {
       "additionalProperties": false,
       "properties": {
@@ -1259,6 +1859,77 @@
         "name"
       ],
       "title": "OwaspCategory",
+      "type": "object"
+    },
+    "PlannedProbeBinding": {
+      "additionalProperties": false,
+      "properties": {
+        "argument_path": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Argument Path",
+          "type": "array"
+        },
+        "attempt_id": {
+          "anyOf": [
+            {
+              "minLength": 1,
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Attempt Id"
+        },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Field"
+        },
+        "mutation": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Mutation"
+        },
+        "probe_id": {
+          "title": "Probe Id",
+          "type": "string"
+        },
+        "tool": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Tool"
+        }
+      },
+      "required": [
+        "probe_id",
+        "tool",
+        "field"
+      ],
+      "title": "PlannedProbeBinding",
       "type": "object"
     },
     "ProbePlan": {
@@ -1317,6 +1988,44 @@
           ],
           "title": "Evidence"
         },
+        "review": {
+          "anyOf": [
+            {
+              "discriminator": {
+                "mapping": {
+                  "cached": "#/$defs/CachedReview",
+                  "degraded": "#/$defs/DegradedReview",
+                  "live": "#/$defs/LiveReview",
+                  "not_reviewed": "#/$defs/NotReviewedReview",
+                  "replay": "#/$defs/ReplayReview"
+                },
+                "propertyName": "mode"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/$defs/NotReviewedReview"
+                },
+                {
+                  "$ref": "#/$defs/DegradedReview"
+                },
+                {
+                  "$ref": "#/$defs/LiveReview"
+                },
+                {
+                  "$ref": "#/$defs/ReplayReview"
+                },
+                {
+                  "$ref": "#/$defs/CachedReview"
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Review"
+        },
         "rule_id": {
           "minLength": 1,
           "title": "Rule Id",
@@ -1346,6 +2055,31 @@
       ],
       "title": "ReasoningEffort",
       "type": "string"
+    },
+    "RecognitionReason": {
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "minLength": 1,
+          "title": "Code",
+          "type": "string"
+        },
+        "location": {
+          "$ref": "#/$defs/FileLocation"
+        },
+        "message": {
+          "minLength": 1,
+          "title": "Message",
+          "type": "string"
+        }
+      },
+      "required": [
+        "code",
+        "message",
+        "location"
+      ],
+      "title": "RecognitionReason",
+      "type": "object"
     },
     "ReplayReview": {
       "additionalProperties": false,
@@ -1515,6 +2249,99 @@
       "title": "ReportWarning",
       "type": "object"
     },
+    "ReviewActivity": {
+      "additionalProperties": false,
+      "properties": {
+        "candidate_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Candidate Count"
+        },
+        "excluded_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Excluded Count"
+        },
+        "modes": {
+          "default": [],
+          "items": {
+            "enum": [
+              "live",
+              "cached",
+              "replay",
+              "degraded"
+            ],
+            "type": "string"
+          },
+          "title": "Modes",
+          "type": "array"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        },
+        "reviewed_count": {
+          "minimum": 0,
+          "title": "Reviewed Count",
+          "type": "integer"
+        },
+        "selected_count": {
+          "minimum": 0,
+          "title": "Selected Count",
+          "type": "integer"
+        },
+        "state": {
+          "enum": [
+            "not_requested",
+            "not_reached",
+            "no_candidates",
+            "all_suppressed",
+            "completed",
+            "incomplete"
+          ],
+          "title": "State",
+          "type": "string"
+        },
+        "unreviewed_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unreviewed Count"
+        }
+      },
+      "required": [
+        "state",
+        "candidate_count",
+        "excluded_count",
+        "selected_count",
+        "reviewed_count",
+        "unreviewed_count",
+        "reason"
+      ],
+      "title": "ReviewActivity",
+      "type": "object"
+    },
     "ReviewStatus": {
       "enum": [
         "confirmed",
@@ -1523,6 +2350,81 @@
       ],
       "title": "ReviewStatus",
       "type": "string"
+    },
+    "RuntimeProof": {
+      "additionalProperties": false,
+      "description": "Host-observed violation; absent on historical dynamic evidence.",
+      "properties": {
+        "argument_path": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Argument Path",
+          "type": "array"
+        },
+        "baseline": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Baseline",
+          "type": "object"
+        },
+        "effects": {
+          "additionalProperties": {
+            "$ref": "#/$defs/JsonValue"
+          },
+          "title": "Effects",
+          "type": "object"
+        },
+        "field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Field"
+        },
+        "schema_checks": {
+          "items": {
+            "additionalProperties": {
+              "$ref": "#/$defs/JsonValue"
+            },
+            "type": "object"
+          },
+          "title": "Schema Checks",
+          "type": "array"
+        },
+        "tool": {
+          "minLength": 1,
+          "title": "Tool",
+          "type": "string"
+        },
+        "verdict": {
+          "const": "violation_observed",
+          "default": "violation_observed",
+          "title": "Verdict",
+          "type": "string"
+        },
+        "version": {
+          "const": 1,
+          "default": 1,
+          "title": "Version",
+          "type": "integer"
+        }
+      },
+      "required": [
+        "tool",
+        "field",
+        "argument_path",
+        "baseline",
+        "schema_checks",
+        "effects"
+      ],
+      "title": "RuntimeProof",
+      "type": "object"
     },
     "ScanSummary": {
       "additionalProperties": false,
@@ -1668,6 +2570,35 @@
       "title": "StageRecord",
       "type": "object"
     },
+    "StageReviewActivity": {
+      "additionalProperties": false,
+      "properties": {
+        "dynamic": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewActivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
+        "static": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewActivity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "title": "StageReviewActivity",
+      "type": "object"
+    },
     "StageStatus": {
       "enum": [
         "pending",
@@ -1681,6 +2612,17 @@
     "StaticAnalysisSummary": {
       "additionalProperties": false,
       "properties": {
+        "coverage": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/StaticCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        },
         "duration_ms": {
           "minimum": 0,
           "title": "Duration Ms",
@@ -1728,6 +2670,63 @@
       "title": "StaticAnalysisSummary",
       "type": "object"
     },
+    "StaticCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "excluded_rule_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Excluded Rule Ids",
+          "type": "array"
+        },
+        "file_wide_rule_ids": {
+          "items": {
+            "type": "string"
+          },
+          "title": "File Wide Rule Ids",
+          "type": "array"
+        },
+        "surfaces": {
+          "items": {
+            "$ref": "#/$defs/StaticSurface"
+          },
+          "title": "Surfaces",
+          "type": "array"
+        },
+        "total_possible_surfaces": {
+          "default": null,
+          "title": "Total Possible Surfaces",
+          "type": "null"
+        },
+        "unresolved_flows": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RecognitionReason"
+          },
+          "title": "Unresolved Flows",
+          "type": "array"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceCoverage"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null
+        }
+      },
+      "required": [
+        "surfaces",
+        "excluded_rule_ids",
+        "file_wide_rule_ids"
+      ],
+      "title": "StaticCoverage",
+      "type": "object"
+    },
     "StaticEvidence": {
       "additionalProperties": false,
       "properties": {
@@ -1743,6 +2742,14 @@
           ],
           "default": null,
           "title": "Fingerprint"
+        },
+        "flow_locations": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/FileLocation"
+          },
+          "title": "Flow Locations",
+          "type": "array"
         },
         "kind": {
           "const": "static",
@@ -1817,6 +2824,78 @@
       ],
       "title": "StaticRuleStatus",
       "type": "string"
+    },
+    "StaticSurface": {
+      "additionalProperties": false,
+      "properties": {
+        "examined_rule_ids": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Examined Rule Ids",
+          "type": "array"
+        },
+        "handler": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FileLocation"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "kind": {
+          "enum": [
+            "tool",
+            "prompt",
+            "http_route"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "location": {
+          "$ref": "#/$defs/FileLocation"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Name"
+        },
+        "reasons": {
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/RecognitionReason"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "status": {
+          "enum": [
+            "recognized",
+            "unresolved",
+            "unsupported"
+          ],
+          "title": "Status",
+          "type": "string"
+        }
+      },
+      "required": [
+        "kind",
+        "name",
+        "location",
+        "handler",
+        "status"
+      ],
+      "title": "StaticSurface",
+      "type": "object"
     },
     "TokenUsage": {
       "additionalProperties": false,
@@ -1902,6 +2981,161 @@
       },
       "title": "TokenUsage",
       "type": "object"
+    },
+    "UnresolvedFieldSpace": {
+      "additionalProperties": false,
+      "properties": {
+        "path": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Path",
+          "type": "array"
+        },
+        "reason": {
+          "minLength": 1,
+          "title": "Reason",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "reason"
+      ],
+      "title": "UnresolvedFieldSpace",
+      "type": "object"
+    },
+    "WorkspaceCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "declarations": {
+          "items": {
+            "type": "string"
+          },
+          "title": "Declarations",
+          "type": "array"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/WorkspaceMemberCoverage"
+          },
+          "title": "Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "declarations",
+        "members"
+      ],
+      "title": "WorkspaceCoverage",
+      "type": "object"
+    },
+    "WorkspaceMemberCoverage": {
+      "additionalProperties": false,
+      "properties": {
+        "nested_configurations": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Nested Configurations",
+          "type": "array"
+        },
+        "path": {
+          "minLength": 1,
+          "title": "Path",
+          "type": "string"
+        },
+        "python_file_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Python File Count"
+        },
+        "reasons": {
+          "default": [],
+          "items": {
+            "minLength": 1,
+            "type": "string"
+          },
+          "title": "Reasons",
+          "type": "array"
+        },
+        "recognized_surface_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Recognized Surface Count"
+        },
+        "status": {
+          "enum": [
+            "included",
+            "unsupported",
+            "incomplete"
+          ],
+          "title": "Status",
+          "type": "string"
+        },
+        "typescript_file_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Typescript File Count"
+        },
+        "unresolved_surface_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unresolved Surface Count"
+        },
+        "unsupported_surface_count": {
+          "anyOf": [
+            {
+              "minimum": 0,
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "title": "Unsupported Surface Count"
+        }
+      },
+      "required": [
+        "path",
+        "status",
+        "python_file_count",
+        "typescript_file_count",
+        "recognized_surface_count",
+        "unresolved_surface_count",
+        "unsupported_surface_count"
+      ],
+      "title": "WorkspaceMemberCoverage",
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -1911,9 +3145,31 @@
       "title": "Analysiscomplete",
       "type": "boolean"
     },
+    "baseline": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/BaselineSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
+    },
     "completed_at": {
       "title": "Completed At",
       "type": "string"
+    },
+    "dynamic_analysis": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/DynamicAnalysisSummary"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null
     },
     "executionSuccessful": {
       "title": "Executionsuccessful",
@@ -1936,14 +3192,17 @@
         }
       ]
     },
+    "review_activity": {
+      "$ref": "#/$defs/StageReviewActivity"
+    },
     "scan_id": {
       "format": "uuid",
       "title": "Scan Id",
       "type": "string"
     },
     "schema_version": {
-      "const": "1.3.0",
-      "default": "1.3.0",
+      "const": "1.7.0",
+      "default": "1.7.0",
       "title": "Schema Version",
       "type": "string"
     },

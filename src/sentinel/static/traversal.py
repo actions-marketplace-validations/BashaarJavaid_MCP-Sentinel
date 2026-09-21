@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -32,14 +33,16 @@ def collect_static_files(
     root: Path,
     ignore_paths: tuple[str, ...],
     language: TargetLanguage = TargetLanguage.PYTHON,
+    forced_ignored_paths: frozenset[str] = frozenset(),
 ) -> StaticFileSet:
     """Return parsed supported files without importing or executing target code."""
 
     python_files: list[ParsedPythonFile] = []
     typescript_files: list[TypeScriptSourceFile] = []
     config_files: list[Path] = []
-    ignored = 0
+    ignored = len(forced_ignored_paths)
     symlinks: list[str] = []
+    warnings: list[ReportWarning] = []
     ignore_specs: dict[Path, GitIgnoreSpec] = {}
     configured = GitIgnoreSpec.from_lines(ignore_paths)
 
@@ -77,11 +80,13 @@ def collect_static_files(
                 path, language
             ):
                 continue
+            if relative in forced_ignored_paths:
+                continue
             if _is_ignored(relative, path, root, ignore_specs, configured):
                 ignored += 1
                 continue
             source = _read_supported(path)
-            if language is TargetLanguage.PYTHON and path.suffix == ".py":
+            if language is not TargetLanguage.TYPESCRIPT and path.suffix == ".py":
                 try:
                     tree = ast.parse(source, filename=relative)
                 except SyntaxError as error:
@@ -96,18 +101,28 @@ def collect_static_files(
                         tree=tree,
                     )
                 )
-            elif language is TargetLanguage.TYPESCRIPT and _is_typescript_source(path):
+            elif language is not TargetLanguage.PYTHON and _is_typescript_source(path):
                 typescript_files.append(
                     TypeScriptSourceFile(
                         path=path, relative_path=relative, source=source
                     )
                 )
             else:
-                _validate_config(path, relative, source, language)
+                if _is_helm_template(path, root, source):
+                    warnings.append(
+                        ReportWarning(
+                            code="static_helm_template_unparsed",
+                            message=(
+                                f"{relative}: Helm template retained for text/secret "
+                                "checks; structured YAML analysis omitted."
+                            ),
+                        )
+                    )
+                else:
+                    _validate_config(path, relative, source, language)
                 config_files.append(path)
 
     visit(root)
-    warnings: list[ReportWarning] = []
     if symlinks:
         shown = ", ".join(symlinks[:20])
         suffix = "" if len(symlinks) <= 20 else ", ..."
@@ -129,10 +144,25 @@ def collect_static_files(
     )
 
 
+def _is_helm_template(path: Path, root: Path, source: str) -> bool:
+    if (
+        path.suffix not in {".yaml", ".yml"}
+        or path.name.startswith("sentinel.")
+        or "{{" not in source
+    ):
+        return False
+    for directory in path.relative_to(root).parents:
+        if directory.name == "templates":
+            chart = root / directory.parent / "Chart.yaml"
+            if chart.is_file() and not chart.is_symlink():
+                return True
+    return False
+
+
 def _is_supported(path: Path, language: TargetLanguage) -> bool:
     return (
-        (language is TargetLanguage.PYTHON and path.suffix == ".py")
-        or (language is TargetLanguage.TYPESCRIPT and _is_typescript_source(path))
+        (language is not TargetLanguage.TYPESCRIPT and path.suffix == ".py")
+        or (language is not TargetLanguage.PYTHON and _is_typescript_source(path))
         or path.suffix in _CONFIG_SUFFIXES
         or (path.name == ".env" or path.name.startswith(".env."))
     )
@@ -249,13 +279,17 @@ def _validate_config(
 ) -> None:
     try:
         if (
-            language is TargetLanguage.TYPESCRIPT
+            language is not TargetLanguage.PYTHON
             and path.name.startswith("tsconfig")
             and path.name.endswith(".json")
         ):
             return
         if path.suffix == ".json":
-            json.loads(source)
+            json.loads(
+                _devcontainer_json(source)
+                if path.name in {"devcontainer.json", ".devcontainer.json"}
+                else source
+            )
         elif path.suffix in {".yaml", ".yml"}:
             yaml.safe_load(source)
         elif path.suffix == ".toml":
@@ -266,6 +300,36 @@ def _validate_config(
         raise ConfigurationError(
             f"cannot parse configuration {relative}: {error}"
         ) from error
+
+
+def _devcontainer_json(source: str) -> str:
+    """Normalize JSONC only for validation; findings still use original bytes."""
+
+    def strip_comment(match: re.Match[str]) -> str:
+        token = match.group()
+        if token.startswith('"'):
+            return token
+        if token.startswith("/*") and (len(token) < 4 or not token.endswith("*/")):
+            raise json.JSONDecodeError("unterminated comment", source, match.start())
+        return re.sub(r"[^\r\n]", " ", token)
+
+    plain = re.sub(
+        r'"(?:\\.|[^"\\])*"|//[^\r\n]*|/\*[\s\S]*?(?:\*/|\Z)',
+        strip_comment,
+        source,
+    )
+    tokens = re.findall(r'"(?:\\.|[^"\\])*"|[^ \t\r\n",\[\]{}]+|[^ \t\r\n]', plain)
+    return " ".join(
+        token
+        for index, token in enumerate(tokens)
+        if not (
+            token == ","
+            and index > 0
+            and tokens[index - 1] not in {"[", "{", ",", ":"}
+            and index + 1 < len(tokens)
+            and tokens[index + 1] in {"}", "]"}
+        )
+    )
 
 
 def _validate_dotenv(source: str) -> None:

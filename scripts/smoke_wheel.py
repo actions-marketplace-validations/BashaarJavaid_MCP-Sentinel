@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import configparser
+import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -15,9 +17,9 @@ from email.parser import BytesParser
 from pathlib import Path
 
 DIST_NAME = "portunusmcp-sentinel"
-VERSION = "1.1.0"
-WHEEL_NAME = "portunusmcp_sentinel-1.1.0-py3-none-any.whl"
-SDIST_NAME = "portunusmcp_sentinel-1.1.0.tar.gz"
+VERSION = "1.4.0"
+WHEEL_NAME = "portunusmcp_sentinel-1.4.0-py3-none-any.whl"
+SDIST_NAME = "portunusmcp_sentinel-1.4.0.tar.gz"
 CLASSIFIERS = {
     "Environment :: Console",
     "Intended Audience :: Developers",
@@ -42,7 +44,7 @@ KEYWORDS = {
 }
 PROJECT_URLS = {
     "Repository": "https://github.com/BashaarJavaid/MCP-Sentinel",
-    "Documentation": "https://github.com/BashaarJavaid/MCP-Sentinel#readme",
+    "Documentation": "https://bashaarjavaid.github.io/MCP-Sentinel/",
     "Changelog": (
         "https://github.com/BashaarJavaid/MCP-Sentinel/blob/main/CHANGELOG.md"
     ),
@@ -58,7 +60,36 @@ def main() -> int:
     artifacts.add_argument("--install-sdist", action="store_true")
     index = commands.add_parser("index")
     index.add_argument("distribution")
+    offline = commands.add_parser("offline")
+    offline.add_argument("executable_dir", type=Path)
     args = parser.parse_args()
+
+    if args.command == "offline":
+        interfaces = Path("/proc/net/dev").read_text().splitlines()[2:]
+        active_interfaces = {
+            name
+            for line in interfaces
+            if (name := line.split(":")[0].strip())
+            and int(Path(f"/sys/class/net/{name}/flags").read_text(), 16) & 1
+        }
+        assert active_interfaces <= {"lo"}, active_interfaces
+        route_interfaces = {
+            line.split()[0]
+            for line in Path("/proc/net/route").read_text().splitlines()
+            if line.strip()
+        } - {"Iface"}
+        route_interfaces.update(
+            line.split()[-1]
+            for line in Path("/proc/net/ipv6_route").read_text().splitlines()
+            if line.strip()
+        )
+        assert route_interfaces <= {"lo"}, route_interfaces
+        print(
+            "Namespace verified: no active external interfaces or IPv4/IPv6 routes "
+            f"({sorted(route_interfaces)})"
+        )
+        _check_rules_only_scans(args.executable_dir)
+        return 0
 
     if args.command == "index":
         expected = f"{DIST_NAME}=={VERSION}"
@@ -113,6 +144,8 @@ def _check_archives(wheel: Path, sdist: Path) -> None:
     assert not any("typescript_clean_server" in name for name in names)
     assert not any("typescript_vulnerable_server" in name for name in names)
     assert not any(name.endswith("/CHANGELOG.md") for name in names)
+    assert not any(name.endswith(".pre-commit-hooks.yaml") for name in names)
+    assert not any(name.endswith("phase12-gpt-smoke.json") for name in names)
 
     with tarfile.open(sdist, "r:gz") as archive:
         names = {member.name for member in archive.getmembers()}
@@ -190,6 +223,7 @@ def _check_pip(wheel: Path) -> None:
         _run(str(python), "-m", "pip", "install", str(wheel))
         _check_install(python, _venv_bin(environment), resources=True)
         _check_typescript_scans(_venv_bin(environment))
+        _check_rules_only_scans(_venv_bin(environment))
 
 
 def _check_pipx(distribution: str | Path) -> None:
@@ -310,6 +344,66 @@ def _check_typescript_scans(executable_dir: Path) -> None:
         assert vulnerable.returncode == 1
 
 
+def _check_rules_only_scans(executable_dir: Path) -> None:
+    sentinel = executable_dir / ("sentinel.exe" if os.name == "nt" else "sentinel")
+    fixtures = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
+    with tempfile.TemporaryDirectory(prefix="sentinel-offline-smoke-") as raw:
+        temporary = Path(raw)
+        for fixture, large in (
+            ("clean_server", False),
+            ("vulnerable_server", False),
+            ("typescript_clean_server", False),
+            ("typescript_vulnerable_server", False),
+            ("vulnerable_server", True),
+            ("typescript_vulnerable_server", True),
+        ):
+            label = fixture + ("-large" if large else "")
+            target = temporary / label
+            shutil.copytree(fixtures / fixture, target)
+            (target / "sentinel.target.yaml").unlink(missing_ok=True)
+            (target / "sentinel.permissions.yaml").unlink(missing_ok=True)
+            if large:
+                typescript = fixture.startswith("typescript")
+                source = target / ("server.ts" if typescript else "server.py")
+                # Exercise installed flow workers on multicore CI without adding
+                # executable fixture behavior or changing existing source locations.
+                with source.open("a", encoding="utf-8") as stream:
+                    stream.write("\n" + ("//" if typescript else "#") + "x" * 131072)
+            for key in ("", "dummy-not-a-real-key"):
+                output = temporary / "report.json"
+                environment = {
+                    **os.environ,
+                    "OPENAI_API_KEY": key,
+                    "OPENAI_BASE_URL": "invalid",
+                    "SENTINEL_LLM_BASE_URL": "http://untrusted.invalid/v1",
+                    "SENTINEL_LLM_TIMEOUT_SECONDS": "invalid",
+                    "SENTINEL_TRUST_LLM_ENDPOINT": "invalid",
+                }
+                completed = subprocess.run(
+                    (
+                        str(sentinel),
+                        "scan",
+                        str(target),
+                        "--rules-only",
+                        "--format",
+                        "json",
+                        "--output",
+                        str(output),
+                    ),
+                    env=environment,
+                    check=False,
+                )
+                assert completed.returncode == (1 if "vulnerable" in fixture else 0)
+                report = json.loads(output.read_text(encoding="utf-8"))
+                assert report["analysisComplete"] and report["executionSuccessful"]
+                assert report["gpt_review"] is None
+                assert report["dynamic_analysis"] is None
+                assert all(finding["review"] is None for finding in report["findings"])
+                print(
+                    f"rules-only {label}, key={bool(key)}: exit {completed.returncode}"
+                )
+
+
 def _run(
     *command: str,
     cwd: Path | None = None,
@@ -320,11 +414,14 @@ def _run(
 
 _IDENTITY_CHECK = """
 from importlib import metadata
+from pathlib import Path
+import sys
 import sentinel
 
+assert Path(sentinel.__file__).resolve().is_relative_to(Path(sys.prefix).resolve())
 distribution = metadata.distribution("portunusmcp-sentinel")
-assert sentinel.__version__ == "1.1.0"
-assert distribution.version == "1.1.0"
+assert sentinel.__version__ == "1.4.0"
+assert distribution.version == "1.4.0"
 scripts = {
     item.name: item.value
     for item in distribution.entry_points

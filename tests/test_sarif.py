@@ -8,11 +8,12 @@ import pytest
 
 from sentinel.config import LoadedConfiguration
 from sentinel.errors import InfrastructureError
-from sentinel.finding import Finding, FindingStatus
+from sentinel.finding import Finding, FindingStatus, InlineSuppression
 from sentinel.orchestrator import run_phase1_scan
-from sentinel.report.model import ScanContext, ScanTarget
+from sentinel.report.model import ScanContext, ScanTarget, summarize
 from sentinel.report.sarif import render_sarif
 from sentinel.report.validate_sarif import validate_sarif_data
+from sentinel.static.catalog import RULE_IDS
 from tests.conftest import NOW, SCAN_ID
 
 
@@ -30,9 +31,10 @@ def test_sarif_shell_validates_and_preserves_failure_state(
     assert payload["version"] == "2.1.0"
     run = payload["runs"][0]
     assert run["tool"]["driver"]["name"] == "MCP Sentinel"
-    assert [item["id"] for item in run["tool"]["driver"]["rules"]] == [
-        f"SENT-{number:03d}" for number in range(1, 8)
-    ]
+    assert run["tool"]["driver"]["fullName"] == (
+        "PortunusMCP Sentinel build-time MCP security scanner"
+    )
+    assert [item["id"] for item in run["tool"]["driver"]["rules"]] == list(RULE_IDS)
     assert run["results"] == []
     for rule in run["tool"]["driver"]["rules"]:
         assert rule["helpUri"].endswith(f"docs/rules.md#{rule['id'].lower()}")
@@ -42,6 +44,10 @@ def test_sarif_shell_validates_and_preserves_failure_state(
     assert invocation["exitCode"] == 3
     assert "arguments" not in invocation and "commandLine" not in invocation
     assert invocation["toolExecutionNotifications"][0]["level"] == "error"
+    assert any(
+        item["properties"]["code"] == "analysis_incomplete"
+        for item in invocation["toolExecutionNotifications"]
+    )
     assert "/Users/" not in text
 
 
@@ -82,3 +88,38 @@ def test_suppressed_result_uses_schema_valid_native_suppression(
     suppression = payload["runs"][0]["results"][0]["suppressions"][0]
     assert suppression["status"] == "accepted"
     assert "state" not in suppression
+
+
+def test_inline_suppression_is_in_source_and_auditable(
+    loaded_config: LoadedConfiguration,
+    sample_finding: Finding,
+) -> None:
+    context = ScanContext(
+        scan_id=SCAN_ID, started_at=NOW, target=ScanTarget(display_name="fixture")
+    )
+    report = run_phase1_scan(loaded_config, context, completed_at=NOW).report
+    finding = sample_finding.model_copy(
+        update={
+            "status": FindingStatus.SUPPRESSED,
+            "suppression": InlineSuppression(
+                reason="reviewed fixture", path="server.py", line=3
+            ),
+        }
+    )
+    report = report.model_copy(
+        update={"findings": (finding,), "summary": summarize((finding,))}
+    )
+    payload = json.loads(render_sarif(report))
+    validate_sarif_data(payload)
+    result = payload["runs"][0]["results"][0]
+    assert result["suppressions"][0] == {
+        "justification": "reviewed fixture",
+        "kind": "inSource",
+        "status": "accepted",
+    }
+    assert result["properties"]["suppression"] == {
+        "kind": "inline",
+        "line": 3,
+        "path": "server.py",
+        "reason": "reviewed fixture",
+    }

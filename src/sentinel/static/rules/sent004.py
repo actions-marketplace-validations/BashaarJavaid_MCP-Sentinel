@@ -1,4 +1,4 @@
-"""SENT-004 intraprocedural prompt-flow analysis."""
+"""SENT-004: track the sanitizer's result, including overwrites and branches."""
 
 from __future__ import annotations
 
@@ -10,92 +10,107 @@ from sentinel.static.ast_utils import (
     match_from_node,
     module_name,
     qualified_name,
+    range_for_node,
     resolve_name,
 )
 from sentinel.static.model import RuleRunState, StaticContext
+from sentinel.static.safety import Condition, paths
 
 
 def detect(context: StaticContext, state: RuleRunState) -> None:
     configured = set(context.configuration.scanner.rules.sent004.sanitizers)
     for file in context.files.python_files:
-        aliases = import_aliases(file)
+        imports = import_aliases(file)
         module = module_name(context.configuration.scan_root, file)
-        functions = [
+        prompts = set(discover_prompt_functions(file))
+        for function in (
             node
             for node in file.tree.body
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        ]
-        prompt_functions = set(discover_prompt_functions(file))
-        for function in functions:
-            tainted: set[str] = set()
-            sanitized: set[str] = set()
-            for item in sorted(
-                ast.walk(function), key=lambda node: getattr(node, "lineno", 0)
-            ):
-                if isinstance(item, (ast.Assign, ast.AnnAssign)):
-                    value = item.value
-                    targets = (
-                        item.targets if isinstance(item, ast.Assign) else [item.target]
+        ):
+            state.visit(file.relative_path, range_for_node(function))
+            prompt_sinks = {
+                node
+                for node in ast.walk(function)
+                if (
+                    isinstance(node, ast.Call)
+                    and (qualified_name(node.func) or "").endswith(
+                        ("responses.create", "chat.completions.create")
                     )
-                    names = {
-                        target.id for target in targets if isinstance(target, ast.Name)
-                    }
-                    if value is not None and _is_source(value):
-                        tainted.update(names)
-                    if isinstance(value, ast.Call):
-                        call_name = qualified_name(value.func)
-                        resolved = resolve_name(call_name, aliases) if call_name else ""
-                        local_name = f"{module}.{call_name}" if call_name else ""
-                        if configured.intersection({resolved, local_name}) and (
-                            _contains_names(value, tainted)
-                        ):
-                            tainted.update(names)
-                            sanitized.update(names)
-                        elif _contains_names(value, tainted):
-                            tainted.update(names)
-                sink = _is_openai_sink(item) or (
-                    function in prompt_functions and isinstance(item, ast.Return)
                 )
-                if sink and _contains_names(item, tainted - sanitized):
-                    state.matches.append(
-                        match_from_node("SENT-004", file, item, "prompt-taint")
+                or (function in prompts and isinstance(node, ast.Return))
+            }
+            if not prompt_sinks:
+                if function in prompts:
+                    state.exempt("sanitizer_or_no_taint")
+                continue
+            event_sinks: dict[ast.AST, list[ast.AST]] = {}
+            found = False
+            for path in paths(function.body, context.deadline):
+                tainted: dict[str, bool] = {}
+
+                def value(
+                    node: ast.AST | None,
+                    tainted: dict[str, bool] = tainted,
+                    imports: dict[str, str] = imports,
+                    module: str = module,
+                ) -> bool:
+                    if node is None:
+                        return False
+                    if isinstance(node, ast.Name):
+                        return tainted.get(node.id, False)
+                    if isinstance(node, ast.Call):
+                        name = qualified_name(node.func) or ""
+                        if configured.intersection(
+                            {resolve_name(name, imports), f"{module}.{name}"}
+                        ):
+                            return False
+                        if name.endswith(("call_tool", "list_tools")):
+                            return True
+                    if isinstance(node, ast.Attribute) and node.attr in {
+                        "text",
+                        "description",
+                        "content",
+                    }:
+                        return True
+                    return any(value(child) for child in ast.iter_child_nodes(node))
+
+                for event in path:
+                    if isinstance(event, Condition):
+                        continue
+                    if event not in event_sinks:
+                        event_sinks[event] = [
+                            node
+                            for node in ast.walk(event)
+                            if node in prompt_sinks and isinstance(node, ast.Call)
+                        ]
+                        if function in prompts and isinstance(event, ast.Return):
+                            event_sinks[event].append(event)
+                    sink = next(
+                        (node for node in event_sinks[event] if value(node)), None
                     )
+                    if sink is not None:
+                        state.matches.append(
+                            match_from_node("SENT-004", file, sink, "prompt-taint")
+                        )
+                        found = True
+                        break
+                    if isinstance(event, (ast.Assign, ast.AnnAssign)):
+                        targets = (
+                            event.targets
+                            if isinstance(event, ast.Assign)
+                            else [event.target]
+                        )
+                        for target in targets:
+                            if isinstance(target, ast.Name):
+                                tainted[target.id] = value(event.value)
+                    elif isinstance(event, ast.AugAssign) and isinstance(
+                        event.target, ast.Name
+                    ):
+                        tainted[event.target.id] = tainted.get(
+                            event.target.id, False
+                        ) or value(event.value)
+                if found:
                     break
-            if function in prompt_functions and not any(
-                match.path == file.relative_path
-                and match.range.start_line >= function.lineno
-                and match.range.end_line <= (function.end_lineno or function.lineno)
-                for match in state.matches
-            ):
+            if function in prompts and not found:
                 state.exempt("sanitizer_or_no_taint")
-
-
-def _is_source(node: ast.AST) -> bool:
-    if isinstance(node, ast.Attribute) and node.attr in {
-        "text",
-        "description",
-        "content",
-    }:
-        return True
-    if isinstance(node, ast.Call):
-        name = qualified_name(node.func) or ""
-        return name.endswith(("call_tool", "list_tools"))
-    return any(_is_source(child) for child in ast.iter_child_nodes(node))
-
-
-def _is_openai_sink(node: ast.AST) -> bool:
-    if not isinstance(node, ast.Call):
-        return False
-    name = qualified_name(node.func) or ""
-    if not name.endswith(("responses.create", "chat.completions.create")):
-        return False
-    return any(
-        keyword.arg in {"input", "instructions", "messages"}
-        for keyword in node.keywords
-    )
-
-
-def _contains_names(node: ast.AST, names: set[str]) -> bool:
-    return any(
-        isinstance(item, ast.Name) and item.id in names for item in ast.walk(node)
-    )

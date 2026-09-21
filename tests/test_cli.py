@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -18,6 +21,7 @@ from sentinel.dynamic.prober import (
     DynamicScanResult,
     ProbeBinding,
     ProbeCampaign,
+    _Observation,
 )
 from sentinel.dynamic.sandbox import DependencyImage, DockerSandbox
 from sentinel.errors import InfrastructureError
@@ -39,14 +43,15 @@ runner = CliRunner()
 def test_version_and_help() -> None:
     version = runner.invoke(app, ["--version"])
     assert version.exit_code == 0
-    assert version.stdout.strip() == "1.1.0"
-    help_result = runner.invoke(app, ["scan", "--help"])
+    assert version.stdout.strip() == "1.4.0"
+    help_result = runner.invoke(app, ["scan", "--help"], terminal_width=160)
     assert help_result.exit_code == 0
     assert "--static-only" in unstyle(help_result.stdout)
     assert "--llm-model" in unstyle(help_result.stdout)
-    assert "--llm-reasoning-ef" in unstyle(help_result.stdout)
+    assert "--llm-reasoning-" in unstyle(help_result.stdout)
     assert "--llm-base-url" in unstyle(help_result.stdout)
-    assert "--trust-llm-endpoi" in unstyle(help_result.stdout)
+    assert "--trust-llm-endp" in unstyle(help_result.stdout)
+    assert "--baseline" in unstyle(help_result.stdout)
 
 
 def test_json_scan_returns_complete_exit_and_clean_stdout(target_root: Path) -> None:
@@ -197,6 +202,29 @@ def test_invalid_output_parent_is_usage_error(
     assert "invalid output path" in result.stderr
 
 
+def test_baseline_cannot_collide_with_output(
+    target_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "baseline.json"
+    path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        "sentinel.cli.load_baseline", lambda _: SimpleNamespace(path=path.resolve())
+    )
+    result = runner.invoke(
+        app,
+        [
+            "scan",
+            str(target_root),
+            "--baseline",
+            str(path),
+            "--output",
+            str(path),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "baseline and output paths must differ" in result.stderr
+
+
 def test_missing_target_uses_target_error_prefix(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path / "missing")])
     assert result.exit_code == 2
@@ -259,7 +287,8 @@ def test_static_only_gpt_failure_is_fatal_or_explicitly_degraded(
     assert fatal_payload["findings"][0]["review"]["mode"] == "not_reviewed"
     fatal_guidance = (
         "OPENAI_API_KEY is not set; set it for GPT review or rerun with "
-        "--allow-degraded to keep rules-only candidates visible and fail-on eligible."
+        "--rules-only for offline static analysis. Use --allow-degraded to "
+        "permit unavailable review while keeping candidates fail-on eligible."
     )
     assert fatal.stderr == f"error: {fatal_guidance}\n"
     assert fatal_payload["warnings"][-1] == {
@@ -299,14 +328,35 @@ def test_static_only_gpt_failure_is_fatal_or_explicitly_degraded(
         nonlocal dynamic_calls
         dynamic_calls += 1
         bindings = {
-            rule_id: ProbeBinding(rule_id, None, None, None)
+            rule_id: ProbeBinding(rule_id, "test", None, None)
             for rule_id in DEFAULT_ORDER
         }
         return DynamicScanResult(
             findings=(),
             warnings=(),
             image=DependencyImage("deps:test", "cache-key", True),
-            campaign=ProbeCampaign(DEFAULT_ORDER, bindings, None, True),
+            campaign=ProbeCampaign(
+                DEFAULT_ORDER,
+                tuple(bindings.values()),
+                None,
+                True,
+                enumeration_complete=True,
+            ),
+            observations=tuple(
+                _Observation(
+                    rule_id,
+                    "test",
+                    None,
+                    {},
+                    {},
+                    (),
+                    False,
+                    started=True,
+                    attempt_id=bindings[rule_id].attempt_id,
+                    mutation=bindings[rule_id].mutation,
+                )
+                for rule_id in DEFAULT_ORDER
+            ),
         )
 
     monkeypatch.setattr("sentinel.orchestrator.reap_orphans", lambda: None)
@@ -370,6 +420,8 @@ def test_demo_validates_and_cleans_temporary_reports(
         **kwargs: object,
     ) -> ScanOutcome:
         del kwargs
+        assert configuration.scanner.scanner.rules_only is False
+        assert configuration.static_only is False
         incomplete = run_phase1_scan(
             configuration,
             context,
@@ -377,6 +429,7 @@ def test_demo_validates_and_cleans_temporary_reports(
         )
         return ScanOutcome(report=incomplete.report, exit_code=1)
 
+    monkeypatch.setenv("SENTINEL_RULES_ONLY", "true")
     monkeypatch.setattr("sentinel.cli.run_scan", fake_run_scan)
     output_dir = tmp_path / "demo-output"
     output_dir.mkdir()
@@ -409,3 +462,180 @@ def test_debug_controls_internal_tracebacks(
     assert debug.exit_code == 3
     assert "Traceback" in debug.stderr
     assert "synthetic internal failure" in debug.stderr
+
+
+@pytest.mark.parametrize("key", (None, "dummy-not-a-real-key"))
+@pytest.mark.parametrize(
+    "fixture",
+    (
+        "clean_server",
+        "vulnerable_server",
+        "typescript_clean_server",
+        "typescript_vulnerable_server",
+    ),
+)
+def test_rules_only_prohibited_paths_and_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, key: str | None, fixture: str
+) -> None:
+    import shutil
+
+    from sentinel.llm.cache import ReviewCache
+    from sentinel.report.validate_json import validate_report_data
+    from sentinel.report.validate_sarif import validate_sarif_data
+
+    root = tmp_path / fixture
+    shutil.copytree(Path(__file__).parent / "fixtures" / fixture, root)
+    (root / "sentinel.target.yaml").write_text(
+        "invalid runtime config", encoding="utf-8"
+    )
+    cache = tmp_path / "user-cache"
+    review_cache = ReviewCache(enabled=True, root=cache / "gpt-review-v1")
+    assert review_cache.write("existing", {"retained": True})
+    cache_file = review_cache.root / "existing.json"
+    original_cache = cache_file.read_bytes()
+    if key:
+        monkeypatch.setenv("OPENAI_API_KEY", key)
+
+    def forbidden(*args: object, **kwargs: object) -> None:
+        pytest.fail("rules-only reached a prohibited path")
+
+    for name in (
+        "SemanticReviewer",
+        "reap_orphans",
+        "DockerSandbox",
+        "run_dynamic_scan",
+        "empty_review_outcome",
+    ):
+        monkeypatch.setattr(f"sentinel.orchestrator.{name}", forbidden)
+    from sentinel.static import semgrep_adapter
+
+    run_process = subprocess.run
+    semgrep_calls: list[list[str]] = []
+    bundled_rules = Path(semgrep_adapter.__file__).parent / "semgrep"
+
+    def checked_process(
+        command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        if Path(command[0]).stem.lower() == "semgrep-core":
+            assert command[1:6] == [
+                "-lang",
+                "typescript",
+                "-json",
+                "-full_token_info",
+                "-dump_ast",
+            ]
+            snapshot = Path(command[-1])
+            assert snapshot.read_bytes() in {
+                path.read_text(encoding="utf-8").encode("utf-8")
+                for path in root.rglob("*.ts")
+                if not path.is_symlink()
+            }
+            assert kwargs["env"]["SEMGREP_SEND_METRICS"] == "off"
+            assert kwargs["env"]["SEMGREP_ENABLE_VERSION_CHECK"] == "0"
+            return run_process(command, **kwargs)
+        assert Path(command[0]).stem.lower() == "semgrep"
+        assert command[1] == "scan"
+        assert command[command.index("--metrics") + 1] == "off"
+        assert "--disable-version-check" in command
+        assert kwargs["env"]["SEMGREP_SEND_METRICS"] == "off"
+        assert kwargs["env"]["SEMGREP_ENABLE_VERSION_CHECK"] == "0"
+        configs = [
+            Path(command[index + 1])
+            for index, value in enumerate(command)
+            if value == "--config"
+        ]
+        assert configs and all(
+            path.is_file() and path.parent == bundled_rules for path in configs
+        )
+        semgrep_calls.append(command)
+        return run_process(command, **kwargs)
+
+    monkeypatch.setattr(
+        "sentinel.static.semgrep_adapter.subprocess.run", checked_process
+    )
+    monkeypatch.setattr("socket.socket.connect", forbidden)
+    monkeypatch.setattr("sentinel.llm.semantic_reviewer.AsyncOpenAI", forbidden)
+    monkeypatch.setattr("sentinel.llm.semantic_reviewer.ReviewCache", forbidden)
+    monkeypatch.setattr("sentinel.llm.cache.ReviewCache.read", forbidden)
+    monkeypatch.setattr("sentinel.llm.cache.ReviewCache.write", forbidden)
+    monkeypatch.setattr("sentinel.llm.cache.user_cache_path", lambda *args: cache)
+    monkeypatch.setenv("SENTINEL_LLM_BASE_URL", "invalid")
+    monkeypatch.setenv("OPENAI_BASE_URL", "invalid")
+    for output_format in ("json", "sarif"):
+        result = runner.invoke(
+            app,
+            [
+                "scan",
+                str(root),
+                "--rules-only",
+                "--format",
+                output_format,
+                "--static-only",
+                "--allow-degraded",
+                "--target-launch-cmd",
+                "invalid | shell",
+            ],
+        )
+        assert result.exit_code == (1 if "vulnerable" in fixture else 0), result.output
+        payload = json.loads(result.stdout)
+        if output_format == "json":
+            validate_report_data(payload)
+            assert payload["analysisComplete"] is True
+            assert payload["gpt_review"] is None
+            assert payload["dynamic_analysis"] is None
+            assert all(
+                f["review"] is None
+                and all(p["review"] is None for p in f["provenance"])
+                for f in payload["findings"]
+            )
+            stages = payload["stages"]
+        else:
+            validate_sarif_data(payload)
+            stages = payload["runs"][0]["invocations"][0]["properties"]["stages"]
+        assert sum(s.get("reason") == "rules-only scan requested" for s in stages) == 3
+    assert semgrep_calls
+    assert cache_file.read_bytes() == original_cache
+
+
+def test_rules_only_baseline_suppression_threshold_and_exits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = make_target(tmp_path / "first", target_yaml="")
+    source = root / "server.py"
+    source.write_text('token = "ghp_0123456789abcdefghijklmnop"\n', encoding="utf-8")
+    args = ["scan", str(root), "--rules-only", "--rules", "SENT-005", "--json"]
+    baseline = tmp_path / "baseline.json"
+    first = runner.invoke(app, [*args, "--output", str(baseline)])
+    assert first.exit_code == 1
+    assert runner.invoke(app, [*args, "--baseline", str(baseline)]).exit_code == 0
+    assert runner.invoke(app, [*args, "--fail-on", "critical"]).exit_code == 0
+    suppressed = (
+        source.read_text().rstrip()
+        + " # sentinel: ignore[SENT-005] reason=test credential\n"
+    )
+    source.write_text(suppressed, encoding="utf-8")
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0
+    finding = json.loads(result.stdout)["findings"][0]
+    assert finding["status"] == "suppressed"
+    assert finding["review"] is None
+    assert finding["suppression"]["reason"] == "test credential"
+    assert runner.invoke(app, [*args, "--rules", "INVALID"]).exit_code == 2
+    monkeypatch.setattr(
+        "sentinel.orchestrator.run_static_scan",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            InfrastructureError("engine unavailable")
+        ),
+    )
+    assert runner.invoke(app, args).exit_code == 3
+
+
+def test_cli_negative_rules_only_override(
+    target_root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("SENTINEL_RULES_ONLY", "true")
+    result = runner.invoke(
+        app, ["scan", str(target_root), "--no-rules-only", "--static-only", "--json"]
+    )
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["gpt_review"] is not None

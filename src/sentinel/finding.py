@@ -139,14 +139,31 @@ class StaticEvidence(ContractModel):
     snippet: str
     range: SourceRange
     fingerprint: Sha256Hex | None = None
+    flow_locations: tuple[FileLocation, ...] = ()
+
+
+class RuntimeProof(ContractModel):
+    """Host-observed violation; absent on historical dynamic evidence."""
+
+    version: Literal[1] = 1
+    verdict: Literal["violation_observed"] = "violation_observed"
+    tool: NonEmptyString
+    field: str | None
+    argument_path: tuple[str, ...]
+    baseline: dict[str, JsonValue]
+    schema_checks: tuple[dict[str, JsonValue], ...]
+    effects: dict[str, JsonValue]
 
 
 class DynamicEvidence(ContractModel):
     kind: Literal["dynamic"] = "dynamic"
     probe_id: NonEmptyString
+    attempt_id: NonEmptyString | None = None
+    mutation: NonEmptyString | None = None
     request: dict[str, JsonValue]
     response: dict[str, JsonValue]
     logs: tuple[str, ...] = ()
+    proof: RuntimeProof | None = None
 
 
 FindingEvidence = Annotated[
@@ -258,6 +275,7 @@ FindingReview = Annotated[
 
 
 class ProvenanceEntry(ContractModel):
+    review: FindingReview | None = None
     source: FindingSource
     rule_id: NonEmptyString
     evidence: FindingEvidence
@@ -271,6 +289,29 @@ class ProvenanceEntry(ContractModel):
     @field_serializer("timestamp", when_used="json")
     def serialize_timestamp(self, value: datetime) -> str:
         return format_utc(value)
+
+
+class InlineSuppression(ContractModel):
+    kind: Literal["inline"] = "inline"
+    reason: str
+    path: NonEmptyString
+    line: int = Field(ge=1)
+
+    @field_validator("reason")
+    @classmethod
+    def validate_reason(cls, value: str) -> str:
+        if value != value.strip() or not 1 <= len(value) <= 500:
+            raise ValueError(
+                "inline suppression reason must be 1-500 trimmed characters"
+            )
+        if not all(character.isprintable() for character in value):
+            raise ValueError("inline suppression reason must contain printable text")
+        return value
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        return normalize_repo_path(value)
 
 
 class Finding(ContractModel):
@@ -291,7 +332,9 @@ class Finding(ContractModel):
     scan_id: UUID
     timestamp: datetime
     provenance: tuple[ProvenanceEntry, ...]
-    review: FindingReview = Field(default_factory=NotReviewedReview)
+    review: FindingReview | None = Field(default_factory=NotReviewedReview)
+    baseline_matched: bool | None = None
+    suppression: InlineSuppression | None = None
 
     @field_validator("finding_id", "scan_id")
     @classmethod
@@ -309,6 +352,27 @@ class Finding(ContractModel):
     def serialize_timestamp(self, value: datetime) -> str:
         return format_utc(value)
 
+    @computed_field(return_type=bool)  # type: ignore[prop-decorator]
+    @property
+    def review_disagrees(self) -> bool:
+        return bool(
+            runtime_evidence(self)
+            and any(
+                review is not None
+                and review.reviewed
+                and review.status is not ReviewStatus.CONFIRMED
+                for review in (
+                    self.review,
+                    *(
+                        entry.review
+                        for entry in self.provenance
+                        if isinstance(entry.evidence, DynamicEvidence)
+                        and entry.evidence.proof is not None
+                    ),
+                )
+            )
+        )
+
     @computed_field(return_type=Severity)  # type: ignore[prop-decorator]
     @property
     def severity(self) -> Severity:
@@ -321,7 +385,75 @@ class Finding(ContractModel):
         origin = self.provenance[0]
         if origin.source != self.source or origin.rule_id != self.rule_id:
             raise ValueError("first provenance entry must match finding origin")
+        if self.suppression is not None:
+            if self.status is not FindingStatus.SUPPRESSED:
+                raise ValueError("inline suppression requires suppressed status")
+            if self.source is not FindingSource.STATIC:
+                raise ValueError("inline suppression requires a static finding")
+            if not isinstance(self.location, FileLocation):
+                raise ValueError("inline suppression requires a file location")
+            if self.suppression.path != self.location.path:
+                raise ValueError("inline suppression must match the finding path")
+            if self.suppression.line not in {
+                self.location.range.start_line - 1,
+                self.location.range.start_line,
+            }:
+                raise ValueError("inline suppression must bind the finding line")
+            if self.review is not None and not isinstance(
+                self.review, NotReviewedReview
+            ):
+                raise ValueError("inline-suppressed findings cannot be GPT-reviewed")
         return self
+
+
+def runtime_evidence(finding: Finding) -> tuple[DynamicEvidence, ...]:
+    """Only explicit host proof counts, including proof merged into static origin."""
+    return tuple(
+        sorted(
+            (
+                entry.evidence
+                for entry in finding.provenance
+                if isinstance(entry.evidence, DynamicEvidence)
+                and entry.evidence.proof is not None
+            ),
+            key=lambda evidence: (evidence.probe_id, evidence.attempt_id or ""),
+        )
+    )
+
+
+def proof_identity(evidence: DynamicEvidence) -> dict[str, JsonValue]:
+    """Stable proof for matching and review; diagnostics stay in reports."""
+    proof = evidence.proof
+    if proof is None:
+        raise ValueError("historical evidence has no verified runtime proof")
+    baseline = proof.baseline
+    baseline_response = baseline.get("response")
+    if evidence.probe_id == "SENT-010":
+        # Canary creation proves this violation regardless of protocol completion.
+        result: dict[str, JsonValue] = {}
+    elif proof.effects.get("resource_failure"):
+        result = {"process_state": evidence.response.get("process_state")}
+    else:
+        result = {"is_error": evidence.response.get("is_error")}
+
+    return {
+        **(
+            {"attempt_id": evidence.attempt_id, "mutation": evidence.mutation}
+            if evidence.attempt_id is not None
+            else {}
+        ),
+        "probe_id": evidence.probe_id,
+        "proof": proof.model_dump(mode="json", exclude={"baseline"}),
+        "request": evidence.request,
+        "baseline": {
+            key: baseline[key]
+            for key in ("tool", "request", "schema_valid", "schema_sha256")
+            if key in baseline
+        },
+        "baseline_succeeded": isinstance(baseline_response, dict)
+        and baseline_response.get("is_error") is False,
+        "result": result,
+    }
 
 
 _SEVERITY_ORDER = (
@@ -405,7 +537,7 @@ def transition_status(
     if needs_reason and not normalized_reason:
         raise ValueError("this transition requires a non-empty reason")
 
-    review_data = finding.review.model_dump(mode="python")
+    review_data = (finding.review or NotReviewedReview()).model_dump(mode="python")
     review_data["status"] = (
         ReviewStatus(target.value)
         if target.value in {item.value for item in ReviewStatus}
@@ -413,9 +545,9 @@ def transition_status(
     )
     if normalized_reason:
         review_data["reason"] = normalized_reason
-    review = type(finding.review).model_validate(review_data)
+    review = type(finding.review or NotReviewedReview()).model_validate(review_data)
 
-    data = finding.model_dump(mode="python", exclude={"severity"})
+    data = finding.model_dump(mode="python", exclude={"severity", "review_disagrees"})
     data.update(status=target, timestamp=ensure_utc(at), review=review)
     return Finding.model_validate(data)
 

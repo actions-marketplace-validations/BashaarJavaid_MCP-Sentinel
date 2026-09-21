@@ -1,5 +1,5 @@
-name: MCP Sentinel
-description: Scan released Python MCP targets; TypeScript requires the upcoming 1.1.0 CLI.
+name: PortunusMCP Sentinel
+description: Scan Python and TypeScript MCP targets before deployment.
 author: Bashaar Javaid
 
 inputs:
@@ -19,6 +19,14 @@ inputs:
     description: Skip Docker-backed dynamic probing while retaining GPT review.
     required: false
     default: "false"
+  rules-only:
+    description: Offline static rules; empty inherits configuration, true or false overrides it. SARIF upload is separate.
+    required: false
+    default: ""
+  baseline:
+    description: Repository-relative native JSON report used as the scan baseline.
+    required: false
+    default: ""
 
 outputs:
   sarif-path:
@@ -28,7 +36,7 @@ outputs:
     description: Number of visible SARIF results, including suppressed findings.
     value: ${{ steps.scan.outputs.findings-count }}
   highest-severity:
-    description: Highest non-suppressed severity, or none.
+    description: Highest fail-eligible severity, or none.
     value: ${{ steps.scan.outputs.highest-severity }}
 
 runs:
@@ -39,14 +47,14 @@ runs:
       with:
         python-version: "3.12"
 
-    - name: Install MCP Sentinel 1.0.0 from PyPI
+    - name: Install PortunusMCP Sentinel 1.4.0 from PyPI
       shell: bash
       run: >-
         python -m pip install --disable-pip-version-check
         --index-url https://pypi.org/simple
-        portunusmcp-sentinel==1.0.0
+        portunusmcp-sentinel==1.4.0
 
-    - name: Run and validate MCP Sentinel
+    - name: Run and validate PortunusMCP Sentinel
       id: scan
       shell: bash
       env:
@@ -56,6 +64,8 @@ runs:
         --target-path "${{ inputs.target-path }}"
         --fail-on "${{ inputs.fail-on }}"
         --static-only "${{ inputs.static-only }}"
+        --baseline "${{ inputs.baseline }}"
+        --rules-only "${{ inputs.rules-only }}"
 
     - name: Upload SARIF to GitHub code scanning
       id: upload
@@ -67,7 +77,7 @@ runs:
         checkout_path: ${{ steps.scan.outputs.checkout-path }}
         category: ${{ steps.scan.outputs.category }}
 
-    - name: Preserve Sentinel exit contract
+    - name: Preserve PortunusMCP Sentinel exit contract
       if: always()
       shell: bash
       env:

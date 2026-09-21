@@ -18,6 +18,7 @@ from uuid import uuid4
 import typer
 
 from sentinel import __version__
+from sentinel.baseline import load_baseline
 from sentinel.config import FailThreshold, OutputFormat, load_configuration
 from sentinel.errors import (
     ConfigurationError,
@@ -77,27 +78,64 @@ def scan(
     path: Path = typer.Argument(..., help="Local MCP repository path."),
     output_format: OutputFormat | None = typer.Option(None, "--format"),
     output: Path | None = typer.Option(None, "--output"),
+    baseline: Path | None = typer.Option(
+        None, "--baseline", help="Compare against a prior native JSON report."
+    ),
     json_output: bool = typer.Option(False, "--json", help="Alias for --format json."),
     fail_on: FailThreshold | None = typer.Option(None, "--fail-on"),
-    allow_degraded: bool = typer.Option(False, "--allow-degraded"),
+    allow_degraded: bool = typer.Option(
+        False,
+        "--allow-degraded",
+        help=(
+            "Permit unavailable GPT review; does not disable model calls. "
+            "No additional effect with --rules-only."
+        ),
+    ),
     target_launch_cmd: str | None = typer.Option(None, "--target-launch-cmd"),
-    static_only: bool = typer.Option(False, "--static-only"),
+    static_only: bool = typer.Option(
+        False,
+        "--static-only",
+        help="Skip Docker, retain GPT review. No additional effect with --rules-only.",
+    ),
+    rules_only: bool | None = typer.Option(
+        None,
+        "--rules-only/--no-rules-only",
+        help="Offline rules: no GPT, review cache, Docker, or target execution.",
+    ),
     rules: str | None = typer.Option(None, "--rules"),
+    max_probe_attempts: int | None = typer.Option(
+        None,
+        "--max-probe-attempts",
+        help="Maximum started runtime attempts (default 24).",
+    ),
+    campaign_timeout_seconds: int | None = typer.Option(
+        None,
+        "--campaign-timeout-seconds",
+        help="Runtime campaign budget including discovery (default 120s).",
+    ),
     llm_model: str | None = typer.Option(None, "--llm-model"),
     llm_reasoning_effort: str | None = typer.Option(None, "--llm-reasoning-effort"),
     llm_base_url: str | None = typer.Option(None, "--llm-base-url"),
     trust_llm_endpoint: bool = typer.Option(False, "--trust-llm-endpoint"),
-    verbose: bool = typer.Option(False, "--verbose", help="Show bounded evidence."),
+    verbose: bool = typer.Option(
+        False, "--verbose", help="Show extended provenance and model reasoning."
+    ),
     color: bool | None = typer.Option(
         None, "--color/--no-color", help="Override terminal color detection."
     ),
 ) -> None:
-    """Run static checks, required GPT review, and available later stages."""
+    """Scan with GPT and Docker by default; select --rules-only for offline use."""
     state = _state(ctx)
     try:
         selected_format = _select_format(output_format, json_output)
+        loaded_baseline = load_baseline(baseline) if baseline is not None else None
+        if loaded_baseline is not None and output is not None:
+            output_path = output if output.is_absolute() else Path.cwd() / output
+            if output_path.resolve() == loaded_baseline.path:
+                raise UsageError("baseline and output paths must differ")
         overrides: dict[str, Any] = {
             "format": selected_format,
+            "rules_only": rules_only,
             "fail_on": fail_on,
             "rules": _parse_rule_tokens(rules) if rules is not None else None,
         }
@@ -108,6 +146,10 @@ def scan(
                 "model": llm_model,
                 "reasoning_effort": llm_reasoning_effort,
                 "base_url": llm_base_url,
+            },
+            sandbox_cli_overrides={
+                "max_probe_attempts": max_probe_attempts,
+                "campaign_timeout_seconds": campaign_timeout_seconds,
             },
             trust_llm_endpoint=trust_llm_endpoint,
             target_launch_cmd=target_launch_cmd,
@@ -127,6 +169,7 @@ def scan(
             completed_at=datetime.now(timezone.utc),
             allow_degraded=allow_degraded,
             api_key=os.environ.get("OPENAI_API_KEY"),
+            baseline=loaded_baseline,
         )
         rendered = _render(
             outcome.report,
@@ -179,6 +222,9 @@ def scan(
 @app.command("init")
 def init_command(
     ctx: typer.Context,
+    dynamic: bool = typer.Option(
+        False, "--dynamic", help="Also scaffold Python Docker launch configuration."
+    ),
     path: str = typer.Argument(".", help="Local MCP repository path."),
     force: bool = typer.Option(
         False, "--force", help="Replace generated regular files."
@@ -188,13 +234,18 @@ def init_command(
 
     state = _state(ctx)
     try:
-        result = initialize_repository(Path(path), force=force)
+        result = initialize_repository(Path(path), force=force, dynamic=dynamic)
         for warning in result.warnings:
             typer.echo(f"warning: {warning.message}", err=True)
         for generated in result.files:
             typer.echo(f"{generated.status}: {display_path(path, generated.name)}")
-        static_only = result.language.value == "typescript"
-        typer.echo(f"Next: {next_scan_command(path, static_only=static_only)}")
+        typer.echo(f"Next: {next_scan_command(path, dynamic=dynamic)}")
+        if dynamic:
+            typer.echo(
+                "Dynamic scanning requires Docker and model credentials. "
+                "GPT review transmits redacted source context and incurs model costs; "
+                "dependency installation requires network access."
+            )
     except TargetError as error:
         typer.echo(f"target error: {error}", err=True)
         raise typer.Exit(2) from error
@@ -223,7 +274,9 @@ def demo(
         "--replay-review",
         help="Replay checked-in GPT responses; never represents a live call.",
     ),
-    verbose: bool = typer.Option(False, "--verbose", help="Show bounded evidence."),
+    verbose: bool = typer.Option(
+        False, "--verbose", help="Show extended provenance and model reasoning."
+    ),
     color: bool | None = typer.Option(
         None, "--color/--no-color", help="Override terminal color detection."
     ),
@@ -239,7 +292,9 @@ def demo(
     try:
         destination = _prepare_demo_output_dir(output_dir)
         with _materialized_demo_resources() as (root, cassettes):
-            configuration = load_configuration(root)
+            configuration = load_configuration(
+                root, cli_overrides={"rules_only": False}
+            )
             now = datetime.now(timezone.utc)
             context = ScanContext(
                 scan_id=uuid4(),
@@ -392,6 +447,9 @@ def _materialized_demo_resources() -> Iterator[tuple[Path, Path]]:
     package = resources.files("sentinel")
     fixture = package.joinpath("_fixtures").joinpath("vulnerable_server")
     cassettes = package.joinpath("_cassettes").joinpath("demo")
+    current = package.joinpath("_cassettes").joinpath("phase17")
+    if current.is_dir():
+        cassettes = current
     if not fixture.is_dir():
         source_fixture = (
             Path(__file__).resolve().parents[2]

@@ -27,10 +27,55 @@ from sentinel.report.sarif import render_sarif
 from sentinel.report.validate_json import validate_report_data
 from sentinel.report.validate_sarif import validate_sarif_data
 from sentinel.static.engine import run_static_scan
+from sentinel.static.model import TypeScriptSourceFile
+from sentinel.static.semgrep_adapter import SEMGREP_TIMEOUT_SECONDS
+from sentinel.static.typescript import _tool_match, tools_in_file
 
 ROOT = Path(__file__).parent / "fixtures"
 NOW = datetime(2026, 9, 3, tzinfo=timezone.utc)
 RUNNER = CliRunner()
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+@pytest.mark.parametrize("named", [False, True])
+@pytest.mark.parametrize(
+    ("rule_id", "token"),
+    [
+        ("SENT-001", None),
+        ("SENT-001", "readFileSync"),
+        ("SENT-002", "eval"),
+        ("SENT-003", "value"),
+    ],
+)
+def test_typescript_handler_evidence_uses_original_source_range(
+    tmp_path: Path, newline: str, named: bool, rule_id: str, token: str | None
+) -> None:
+    body = "\n  readFileSync(value);\n  return eval(value);\n"
+    source = (
+        'import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";\n'
+        'import { readFileSync } from "node:fs";\n'
+        "// Unicode before the handler: café 🐎\n"
+        'const server = new McpServer({name: "coordinates", version: "1"});\n'
+    )
+    if named:
+        source += "function handle(value) {" + body + "}\n"
+    source += (
+        'server.registerTool(\n  "dangerous",\n'
+        '  {description: "Several metadata lines before the callback."},\n  '
+        + ("handle" if named else "(value) => {" + body + "}")
+        + "\n);\n"
+    )
+    source = source.replace("\n", newline)
+    file = TypeScriptSourceFile(tmp_path / "server.ts", "server.ts", source)
+    (tool,) = tools_in_file(file)
+    offset = tool.handler.index(token) if token else None
+    match = _tool_match(rule_id, tool, "source-coordinate-control", offset)
+    expected = "server.registerTool(" if token is None else token
+    location = match.range
+    line = source.splitlines()[location.start_line - 1]
+    assert line[location.start_column - 1 : location.end_column - 1] == match.snippet
+    assert match.snippet.startswith(expected)
+    assert location.start_line == location.end_line
 
 
 @pytest.mark.parametrize(
@@ -114,6 +159,7 @@ def test_typescript_live_smoke_cassette_replays() -> None:
     assert outcome.exit_code == 0
     review = outcome.report.findings[0].review
     assert outcome.report.findings[0].status.value == "confirmed"
+    assert review is not None
     assert review.evidence_refs is not None
     assert len(review.evidence_refs) == 1
     assert review.probe_plan is not None
@@ -281,6 +327,7 @@ def test_typescript_metadata_warnings_and_tools_manifest_recovery(
     root = _typescript_target(
         tmp_path / "target",
         """
+import express from "express";
 const server = new McpServer({name: "v2", version: "2"});
 const app = express();
 const dynamicName = process.env.TOOL_NAME;
@@ -407,9 +454,11 @@ def test_scan_invokes_only_semgrep_and_never_package_lifecycle(
     )
     original = subprocess.run
     commands: list[tuple[str, ...]] = []
+    process_timeouts: list[float] = []
 
     def record(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         commands.append(tuple(command))
+        process_timeouts.append(cast(float, kwargs["timeout"]))
         return cast(subprocess.CompletedProcess[str], original(command, **kwargs))
 
     monkeypatch.setattr("sentinel.static.semgrep_adapter.subprocess.run", record)
@@ -417,7 +466,21 @@ def test_scan_invokes_only_semgrep_and_never_package_lifecycle(
     run_static_scan(configuration, uuid4(), timestamp=NOW)
 
     assert commands and all(
-        Path(command[0]).stem.lower() == "semgrep" for command in commands
+        Path(command[0]).stem.lower() in {"semgrep", "semgrep-core"}
+        for command in commands
+    )
+    assert all(
+        "-dump_ast" in command
+        for command in commands
+        if Path(command[0]).stem.lower() == "semgrep-core"
+    )
+    assert all(
+        command[command.index("--timeout") + 1] == str(SEMGREP_TIMEOUT_SECONDS)
+        for command in commands
+        if Path(command[0]).stem.lower() == "semgrep"
+    )
+    assert process_timeouts and all(
+        timeout > SEMGREP_TIMEOUT_SECONDS for timeout in process_timeouts
     )
     assert not (root / "lifecycle-marker").exists()
 

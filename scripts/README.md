@@ -1,7 +1,8 @@
 # Maintenance scripts
 
-`capture_gpt_reviews.py` plans or captures the five approved GPT checkpoints,
-including the Phase 3 static-review → Docker-probe → dynamic-review chain.
+`capture_gpt_reviews.py` plans or captures the six approved GPT checkpoints,
+including the Phase 3 static-review → Docker-probe → dynamic-review chain
+and the two-call Phase 12 Python/TypeScript smoke.
 It defaults to an offline dry run. Paid calls require all of `--live`, an
 explicit `--max-usd` ceiling, and `OPENAI_API_KEY` in the environment.
 Capture calls use one attempt and reserve each request's worst case immediately
@@ -16,7 +17,7 @@ orphan-reaper and the final three-treatment ablation.
 Routine mode uses checked GPT cassettes and isolated Docker campaigns. The
 explicit `--live --max-usd 0.50` mode additionally refreshes the checked live
 SARIF through a scan-wide hard-budget transport. `--check` validates both
-checked judge artifacts without making GPT calls or launching Docker.
+checked historical artifacts without making GPT calls or launching Docker.
 
 `generate_third_party_notices.py` generates or checks the locked runtime
 dependency license inventory without an additional package dependency.

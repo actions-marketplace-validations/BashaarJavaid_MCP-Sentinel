@@ -1,6 +1,6 @@
-# Generated artifacts
+# Historical generated artifacts
 
-Judge-facing evidence in this directory is generated, never hand-edited.
+Historical evidence in this directory is generated, never hand-edited.
 
 - `gpt-ablation.json` compares rules-only, GPT-reviewed, and GPT-plus-Docker
   results over the checked truth set. Regenerate it offline with `make artifacts`.
@@ -9,6 +9,10 @@ Judge-facing evidence in this directory is generated, never hand-edited.
 - `phase4-action-evidence.md` records the accepted live GitHub Action proof.
 - `phase8-marketplace-evidence.md` records the stable `v1` Marketplace release,
   trusted package publication, and paired external Action proof.
+- `phase12-gpt-smoke.json` contains non-content telemetry for the accepted,
+  two-call Python/TypeScript GPT-5.6 adoption checkpoint.
+- `phase12-adoption-evidence.md` records the signed `v1.2.0` release, trusted
+  package publication, exact/alias Action proofs, retained SARIF, and spend.
 
 Run `make artifacts-check` to validate the ablation quality gate, SARIF schema,
 live-review telemetry, and the exact `SENT-001` through `SENT-011` result set.

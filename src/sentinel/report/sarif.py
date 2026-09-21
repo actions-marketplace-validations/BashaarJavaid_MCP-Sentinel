@@ -37,6 +37,7 @@ from sentinel.finding import (
     StaticEvidence,
 )
 from sentinel.report.model import ScanReport
+from sentinel.report.presentation import concise_finding
 from sentinel.static.catalog import RULE_BY_ID as STATIC_RULE_BY_ID
 
 SARIF_SCHEMA_URI = (
@@ -58,6 +59,15 @@ def render_sarif(report: ScanReport) -> str:
                 properties={"code": "analysis_incomplete"},
             )
         )
+    notifications.extend(
+        Notification(
+            level="warning",
+            message=Message(text=warning.message),
+            time_utc=_format_datetime(report.completed_at),
+            properties={"code": warning.code},
+        )
+        for warning in report.warnings
+    )
     if report.gpt_review is not None and report.gpt_review.mode == "replay":
         notifications.append(
             Notification(
@@ -73,7 +83,9 @@ def render_sarif(report: ScanReport) -> str:
         execution_successful=report.execution_successful,
         exit_code=0 if report.analysis_complete else 3,
         exit_code_description=(
-            "Analysis completed" if report.analysis_complete else "Analysis incomplete"
+            "Selected analysis completed; coverage limits remain"
+            if report.analysis_complete
+            else "Analysis incomplete"
         ),
         start_time_utc=_format_datetime(report.started_at),
         end_time_utc=_format_datetime(report.completed_at),
@@ -81,9 +93,13 @@ def render_sarif(report: ScanReport) -> str:
         properties={
             "analysisComplete": report.analysis_complete,
             "schemaVersion": report.schema_version,
+            "stages": [stage.model_dump(mode="json") for stage in report.stages],
             "findingCount": report.summary.total,
             "staticAnalysis": _model_data(report.static_analysis),
+            "dynamicAnalysis": _model_data(report.dynamic_analysis),
+            "reviewActivity": _model_data(report.review_activity),
             "gptReview": _model_data(report.gpt_review),
+            "baseline": _model_data(report.baseline),
         },
     )
     selected_static = (
@@ -96,7 +112,7 @@ def render_sarif(report: ScanReport) -> str:
     )
     driver = ToolComponent(
         name="MCP Sentinel",
-        full_name="MCP Sentinel build-time MCP security scanner",
+        full_name="PortunusMCP Sentinel build-time MCP security scanner",
         information_uri="https://github.com/BashaarJavaid/MCP-Sentinel",
         semantic_version=report.sentinel_version,
         version=report.sentinel_version,
@@ -167,20 +183,38 @@ def _rule_descriptor(rule_id: str) -> ReportingDescriptor:
 def _result(finding: Finding, selected: tuple[str, ...]) -> Result:
     location = _location(finding)
     suppressions = None
-    if finding.status is FindingStatus.SUPPRESSED:
+    if finding.suppression is not None:
+        suppressions = [
+            Suppression(
+                kind="inSource",
+                state="accepted",
+                justification=finding.suppression.reason,
+            )
+        ]
+    elif finding.status is FindingStatus.SUPPRESSED:
         suppressions = [
             Suppression(
                 kind="external",
                 state="accepted",
-                justification=finding.review.reason or "Suppressed by Sentinel review",
+                justification=(finding.review.reason if finding.review else None)
+                or "Suppressed by Sentinel review",
             )
         ]
     return Result(
         rule_id=finding.rule_id,
         rule_index=selected.index(finding.rule_id),
         level=_sarif_level(finding.severity),
-        message=Message(text=f"{finding.title}: {finding.description}"),
+        message=Message(
+            text=finding.title + "\n" + "\n".join(concise_finding(finding))
+        ),
         locations=[location],
+        baseline_state=(
+            "unchanged"
+            if finding.baseline_matched is True
+            else "new"
+            if finding.baseline_matched is False
+            else None
+        ),
         fingerprints={"sentinel/v1": finding.dedup_key},
         suppressions=suppressions,
         properties={
@@ -196,8 +230,11 @@ def _result(finding: Finding, selected: tuple[str, ...]) -> Result:
             "owaspName": finding.owasp_category.name,
             "evidence": finding.evidence.model_dump(mode="json"),
             "provenance": [item.model_dump(mode="json") for item in finding.provenance],
-            "review": finding.review.model_dump(mode="json"),
+            "review": _model_data(finding.review),
+            "reviewDisagrees": finding.review_disagrees,
             "remediation": finding.remediation,
+            "baselineMatched": finding.baseline_matched,
+            "suppression": _model_data(finding.suppression),
         },
     )
 

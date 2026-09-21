@@ -18,6 +18,7 @@ from scripts.run_github_action import (
     emit_action_state,
     execute_action,
     render_step_summary,
+    resolve_baseline,
     resolve_target,
     sarif_category,
 )
@@ -143,6 +144,13 @@ def test_analyze_sarif_counts_all_results_but_excludes_suppressed_severity(
     suppressed_metrics = analyze_sarif(_sarif_payload(suppressed))
     assert suppressed_metrics.findings_count == 1
     assert suppressed_metrics.highest_severity == "none"
+
+    runs = cast(list[dict[str, Any]], payload["runs"])
+    result = cast(list[dict[str, Any]], runs[0]["results"])[0]
+    cast(dict[str, Any], result["properties"])["baselineMatched"] = True
+    baseline_metrics = analyze_sarif(payload)
+    assert baseline_metrics.findings_count == 1
+    assert baseline_metrics.highest_severity == "none"
 
 
 @pytest.mark.parametrize("scan_exit", [0, 1, 3])
@@ -270,6 +278,22 @@ def test_target_must_remain_inside_workspace(tmp_path: Path) -> None:
     )
 
 
+def test_baseline_must_be_regular_and_inside_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    baseline = workspace / "baseline.json"
+    baseline.write_text("{}", encoding="utf-8")
+    assert resolve_baseline(workspace.resolve(), "baseline.json") == baseline
+    assert resolve_baseline(workspace.resolve(), "") is None
+
+    link = workspace / "link.json"
+    link.symlink_to(baseline)
+    with pytest.raises(ValueError, match="symlink"):
+        resolve_baseline(workspace.resolve(), "link.json")
+    with pytest.raises(ValueError, match="in GITHUB_WORKSPACE"):
+        resolve_baseline(workspace.resolve(), "../outside.json")
+
+
 def test_outputs_and_summary_are_aggregate_only(tmp_path: Path) -> None:
     output = tmp_path / "output"
     summary = tmp_path / "summary"
@@ -304,6 +328,7 @@ def test_outputs_and_summary_are_aggregate_only(tmp_path: Path) -> None:
     summary_text = summary.read_text(encoding="utf-8")
     assert "findings-count=2" in output_text
     assert "highest-severity=critical" in output_text
+    assert summary_text.startswith("## PortunusMCP Sentinel\n")
     assert "Mode | replay" in summary_text
     assert "Reviewed / skipped | 1 / 1" in summary_text
     assert "Truncated | yes (1 overflow)" in summary_text
@@ -313,14 +338,18 @@ def test_outputs_and_summary_are_aggregate_only(tmp_path: Path) -> None:
 def test_action_metadata_exposes_only_approved_interface() -> None:
     root = Path(__file__).resolve().parents[1]
     metadata = yaml.safe_load((root / "action.yml").read_text(encoding="utf-8"))
+    assert metadata["name"] == "PortunusMCP Sentinel"
     assert set(metadata["inputs"]) == {
         "target-path",
         "fail-on",
         "openai-api-key",
         "static-only",
+        "rules-only",
+        "baseline",
     }
     assert metadata["inputs"]["target-path"]["default"] == "."
     assert metadata["inputs"]["fail-on"]["default"] == "high"
+    assert metadata["inputs"]["baseline"]["default"] == ""
     assert set(metadata["outputs"]) == {
         "sarif-path",
         "findings-count",
@@ -329,7 +358,7 @@ def test_action_metadata_exposes_only_approved_interface() -> None:
     assert metadata["runs"]["steps"][0]["with"]["python-version"] == "3.12"
     assert metadata["runs"]["steps"][1]["run"] == (
         "python -m pip install --disable-pip-version-check "
-        "--index-url https://pypi.org/simple portunusmcp-sentinel==1.0.0"
+        "--index-url https://pypi.org/simple portunusmcp-sentinel==1.4.0"
     )
     uses = [step.get("uses", "") for step in metadata["runs"]["steps"]]
     assert any(value.startswith("actions/setup-python@ece7cb06") for value in uses)
@@ -343,3 +372,126 @@ def test_action_metadata_exposes_only_approved_interface() -> None:
     ci_text = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     assert "python -m pip install pipx\n" not in release_text + ci_text
     assert "python -m pip install pipx==1.16.0" in release_text + ci_text
+
+
+@pytest.mark.parametrize("fork", (False, True))
+@pytest.mark.parametrize("selection", ("", "true", "false"))
+def test_rules_only_action_inheritance_override_and_summary(
+    tmp_path: Path, fork: bool, selection: str
+) -> None:
+    import shutil
+
+    from typer.testing import CliRunner
+
+    from sentinel.cli import app
+
+    workspace = tmp_path / "workspace"
+    target = workspace / "server"
+    shutil.copytree(Path(__file__).parent / "fixtures/vulnerable_server", target)
+    (target / "sentinel.toml").write_text(
+        "[scanner]\nrules_only = true\n", encoding="utf-8"
+    )
+    temporary = tmp_path / "runner"
+    temporary.mkdir()
+    environment = _environment(workspace, temporary)
+    environment.pop("SENTINEL_ACTION_OPENAI_API_KEY")
+    event = tmp_path / "event.json"
+    event.write_text(
+        json.dumps(
+            {
+                "pull_request": {
+                    "head": {
+                        "repo": {
+                            "full_name": "fork/repo"
+                            if fork
+                            else environment["GITHUB_REPOSITORY"]
+                        }
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    environment.update(GITHUB_EVENT_NAME="pull_request", GITHUB_EVENT_PATH=str(event))
+
+    def run(
+        command: list[str], *, env: dict[str, str], check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        assert "OPENAI_API_KEY" not in env
+        if selection:
+            assert (
+                "--rules-only" if selection == "true" else "--no-rules-only"
+            ) in command
+        else:
+            assert "--rules-only" not in command and "--no-rules-only" not in command
+        result = CliRunner().invoke(app, command[3:], env=env)
+        return subprocess.CompletedProcess(command, result.exit_code)
+
+    result = execute_action(
+        ActionInputs("server", "high", "true", rules_only=selection),
+        environment,
+        command_runner=run,
+    )
+    assert result.effective_exit_code == (3 if selection == "false" and not fork else 1)
+    assert result.upload_ready is not fork
+    summary = render_step_summary(result)
+    if selection != "false":
+        assert result.metrics.rules_only
+        assert "RULES-ONLY" in summary
+        assert "degraded" not in summary.lower()
+        assert result.metrics.review is None
+
+
+def test_legacy_sarif_without_stages_remains_readable() -> None:
+    payload = _sarif_payload()
+    runs = cast(list[dict[str, Any]], payload["runs"])
+    runs[0]["invocations"][0]["properties"].pop("stages")
+    metrics = analyze_sarif(payload)
+    assert metrics.analysis_complete
+    assert metrics.rules_only is False
+
+
+def test_action_consumes_repository_campaign_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from typer.testing import CliRunner
+
+    from sentinel.cli import app
+    from sentinel.config import LoadedConfiguration
+    from sentinel.orchestrator import ScanOutcome
+    from tests.conftest import make_target
+    from tests.test_baseline import _report
+
+    workspace = tmp_path / "workspace"
+    make_target(
+        workspace / "server",
+        scanner_toml="[sandbox]\nmax_probe_attempts=7\ncampaign_timeout_seconds=31\n",
+    )
+    temporary = tmp_path / "runner"
+    temporary.mkdir()
+    captured = []
+
+    def scan(
+        configuration: LoadedConfiguration, *args: Any, **kwargs: Any
+    ) -> ScanOutcome:
+        captured.append(configuration.scanner.sandbox)
+        return ScanOutcome(report=_report(()), exit_code=0)
+
+    monkeypatch.setattr("sentinel.cli.run_scan", scan)
+
+    def command_runner(
+        command: list[str], *, env: dict[str, str], check: bool
+    ) -> subprocess.CompletedProcess[str]:
+        result = CliRunner().invoke(app, command[3:], env=env)
+        assert result.exit_code == 0, result.output
+        return subprocess.CompletedProcess(command, result.exit_code)
+
+    result = execute_action(
+        ActionInputs("server", "high", "false"),
+        _environment(workspace, temporary),
+        command_runner=command_runner,
+    )
+    assert result.effective_exit_code == 0
+    assert [
+        (item.max_probe_attempts, item.campaign_timeout_seconds) for item in captured
+    ] == [(7, 31)]

@@ -15,6 +15,7 @@ from sentinel.finding import (
     StaticEvidence,
 )
 from sentinel.report.model import ScanReport
+from sentinel.report.presentation import concise_finding
 
 _SEVERITY_RANK = {
     Severity.CRITICAL: 0,
@@ -37,11 +38,13 @@ def render_console(
 ) -> str:
     status = "COMPLETE" if report.analysis_complete else "INCOMPLETE"
     lines = [
-        _style(f"MCP Sentinel {report.sentinel_version}", color, bold=True),
+        _style(f"PortunusMCP Sentinel {report.sentinel_version}", color, bold=True),
         f"Target: {report.target.display_name}",
         f"Status: {_status_text(status, report.analysis_complete, color)}",
         _summary_line(report),
     ]
+    if any(stage.reason == "rules-only scan requested" for stage in report.stages):
+        lines.append("Tier: RULES-ONLY · GPT review and dynamic probes skipped")
     if report.static_analysis is not None:
         static = report.static_analysis
         lines.extend(
@@ -61,6 +64,54 @@ def render_console(
             )
             for reason, count in outcome.exemptions_by_reason.items():
                 lines.append(f"    exempt {reason}: {count}")
+    lines.extend(_coverage_lines(report))
+    if report.dynamic_analysis is not None:
+        lines.extend(("", _style("Dynamic probes", color, bold=True)))
+        for probe in report.dynamic_analysis.probe_outcomes:
+            binding = ".".join(
+                part for part in (probe.tool, *probe.argument_path) if part
+            )
+            verdict = f" · {probe.verdict}" if probe.verdict else ""
+            lines.append(
+                f"  {probe.probe_id}: {probe.status}{verdict} · "
+                f"{binding or 'unbound'} — {probe.reason} · "
+                f"baseline sent={probe.baseline_attempted}, "
+                f"attack sent={probe.attack_attempted}"
+            )
+            lines.append(
+                f"    attempt {probe.attempt_id}; mutation={probe.mutation!r}; "
+                f"legacy={probe.legacy_attempt}"
+            )
+            response = probe.baseline.get("response")
+            process = (
+                response.get("process_state") if isinstance(response, dict) else None
+            )
+            lines.append(
+                "    baseline control succeeded="
+                + str(
+                    isinstance(response, dict)
+                    and response.get("is_error") is False
+                    and isinstance(process, dict)
+                    and process.get("Running") is True
+                    if isinstance(response, dict) and isinstance(process, dict)
+                    else "unknown"
+                )
+            )
+    if report.baseline is not None:
+        baseline = report.baseline
+        lines.extend(
+            (
+                "",
+                _style("Baseline", color, bold=True),
+                f"  matched {baseline.matched_finding_count}, new "
+                f"{baseline.new_finding_count}, resolved "
+                f"{baseline.resolved_finding_count} (not observed in this scan), prior "
+                f"{baseline.baseline_finding_count}",
+                f"  {baseline.matcher_version}, schema "
+                f"{baseline.source_schema_version}, source "
+                f"{baseline.source_sha256[:12]}",
+            )
+        )
     if report.gpt_review is not None:
         review = report.gpt_review
         label = review.mode.upper()
@@ -73,7 +124,7 @@ def render_console(
                 f"  model {review.requested_model}, reasoning "
                 f"{review.reasoning_effort.value}, endpoint "
                 f"{review.endpoint_mode.value}",
-                f"  confirmed {review.confirmed_count}, suppressed "
+                f"  model judgments: confirmed {review.confirmed_count}, suppressed "
                 f"{review.suppressed_count}, needs review {review.needs_review_count}",
                 f"  cache {review.cache_hits} hit(s), {review.cache_misses} miss(es)",
                 f"  origin tokens {review.origin_usage.total_tokens or 0}, "
@@ -84,6 +135,8 @@ def render_console(
                 ),
             )
         )
+        if review.disagreement_count:
+            lines.append(f"  runtime proof disagreements: {review.disagreement_count}")
         if review.mode == "replay":
             lines.append(
                 _style("  RECORDED REPLAY — no live model call", color, fg="yellow")
@@ -108,7 +161,8 @@ def render_console(
     lines.extend(
         (
             "",
-            "Analysis complete."
+            "Selected analysis complete. Coverage limits remain; "
+            "this is not proof of safety."
             if report.analysis_complete
             else "Analysis incomplete.",
         )
@@ -157,11 +211,20 @@ def _finding_lines(finding: Finding, *, verbose: bool, color: bool) -> tuple[str
         bold=finding.severity is Severity.CRITICAL,
     )
     status = _finding_status(finding, color)
+    baseline = (
+        " · baseline"
+        if finding.baseline_matched is True
+        else " · new"
+        if finding.baseline_matched is False
+        else ""
+    )
     lines = [
-        f"  {severity} {finding.rule_id} {finding.title} · {status}",
+        f"  {severity} {finding.rule_id} {finding.title} · {status}{baseline}",
         f"    {where} · {finding.owasp_category.id} {finding.owasp_category.name}",
-        f"    Remediation: {finding.remediation}",
     ]
+    lines.extend(
+        "    " + line.replace("\n", "\n    ") for line in concise_finding(finding)
+    )
     if verbose:
         lines.extend(_verbose_finding_lines(finding))
     return tuple(lines)
@@ -180,9 +243,9 @@ def _verbose_finding_lines(finding: Finding) -> tuple[str, ...]:
         lines.append(f"    Outcome: {response[:240]}")
         if evidence.logs:
             lines.append(f"    Logs: {' | '.join(evidence.logs[-3:])[:240]}")
-    if finding.review.reasoning:
+    if finding.review and finding.review.reasoning:
         lines.append(f"    GPT reasoning: {finding.review.reasoning[:500]}")
-    for reference in finding.review.evidence_refs or ():
+    for reference in (finding.review.evidence_refs or ()) if finding.review else ():
         lines.append(
             f"    Claim: {reference.path}:{reference.range.start_line} — "
             f"{reference.claim[:300]}"
@@ -220,3 +283,165 @@ def _style(
     if not color:
         return value
     return typer.style(value, fg=fg, bold=bold, dim=dim)
+
+
+def _coverage_lines(report: ScanReport) -> list[str]:
+    lines: list[str] = []
+    static = report.static_analysis.coverage if report.static_analysis else None
+    if static is not None:
+        if static.workspace is not None:
+            lines.append("Workspace coverage (root Sentinel configuration):")
+            for member in static.workspace.members:
+                lines.append(
+                    f"  {member.path}: {member.status}; "
+                    f"Python files={member.python_file_count}, "
+                    f"TypeScript files={member.typescript_file_count}; surfaces "
+                    f"recognized={member.recognized_surface_count}, "
+                    f"unresolved={member.unresolved_surface_count}, "
+                    f"unsupported={member.unsupported_surface_count}"
+                )
+                lines.extend(f"    {reason}" for reason in member.reasons)
+                lines.extend(
+                    f"    Nested configuration not applied: {path}"
+                    for path in member.nested_configurations
+                )
+        lines.extend(
+            (
+                "",
+                f"Static surface inventory: {len(static.surfaces)} observed; "
+                "total possible unknown",
+            )
+        )
+        for surface in static.surfaces:
+            loc = surface.location
+            handler = surface.handler
+            lines.append(
+                f"  {surface.kind} {surface.name!r} at {loc.path}:"
+                f"{loc.range.start_line}:{loc.range.start_column}: {surface.status}; "
+                "examined by "
+                f"{', '.join(surface.examined_rule_ids) or 'no handler rule'}"
+            )
+            if handler:
+                lines.append(
+                    f"    handler {handler.path}:{handler.range.start_line}:"
+                    f"{handler.range.start_column}"
+                )
+            lines.extend(
+                f"    {reason.code}: {reason.message}" for reason in surface.reasons
+            )
+        lines.extend(
+            f"  {gap.code} at {gap.location.path}:"
+            f"{gap.location.range.start_line}: {gap.message}"
+            for gap in static.unresolved_flows
+        )
+        lines.append(
+            "  Configuration-excluded rules: "
+            f"{', '.join(static.excluded_rule_ids) or 'none'}"
+        )
+        lines.append(
+            "  File/configuration-wide rules: "
+            f"{', '.join(static.file_wide_rule_ids) or 'none'}"
+        )
+        lines.append(
+            "  Rule evaluated does not mean every implementation was recognized."
+        )
+    elif report.static_analysis:
+        lines.append("Static surface coverage: unavailable")
+    dynamic = report.dynamic_analysis
+    if dynamic and dynamic.coverage:
+        lines.extend(
+            (
+                "",
+                "Runtime discovery: separate baseline/attack sessions; "
+                "bounded attempt coverage",
+            )
+        )
+        for binding in dynamic.coverage.planned_bindings:
+            lines.append(
+                f"  Planned {binding.probe_id}: tool={binding.tool!r}, "
+                f"field={binding.field!r} (null uses runtime fallback)"
+            )
+        campaign = dynamic.coverage.campaign
+        if campaign:
+            lines.append(
+                f"  Campaign: {campaign.started_attempts}/{campaign.eligible_attempts} "
+                "eligible attempts started; "
+                f"{campaign.tested_attempts} tested; "
+                f"{campaign.remaining_eligible_attempts} eligible untested; "
+                f"limits {campaign.max_probe_attempts} attempts/"
+                f"{campaign.timeout_seconds}s; "
+                f"budget exhausted={campaign.budget_exhausted}; "
+                f"enumeration complete={campaign.enumeration_complete}"
+            )
+        else:
+            lines.append("  Campaign coverage: unknown")
+        outcomes = {item.attempt_id: item for item in dynamic.probe_outcomes}
+        for snapshot in dynamic.coverage.discovery:
+            total = (
+                str(snapshot.tool_total)
+                if snapshot.tool_total is not None
+                else "unknown"
+            )
+            lines.append(
+                f"  {snapshot.probe_id} {snapshot.role}: "
+                f"{len(snapshot.tools)} observed, session total {total}, "
+                f"more pages={snapshot.more_pages}"
+            )
+            if snapshot.reason:
+                lines.append(f"    {snapshot.reason}")
+            outcome = outcomes.get(snapshot.attempt_id or "")
+            for tool in snapshot.tools:
+                attacked = (
+                    snapshot.role == "attack"
+                    and outcome is not None
+                    and outcome.attack_attempted is True
+                    and outcome.tool == tool.name
+                )
+                paths = tuple(
+                    path
+                    for path in tool.field_paths
+                    if attacked
+                    and outcome is not None
+                    and path == outcome.argument_path
+                )
+                unprobed = tuple(path for path in tool.field_paths if path not in paths)
+                lines.append(
+                    f"    {tool.name!r}: attack "
+                    f"{'sent' if attacked else 'not sent in this session'}; "
+                    f"schema {tool.schema_sha256 or 'unknown'}"
+                )
+                lines.append(
+                    f"      fields attacked: {json.dumps(paths)}; "
+                    f"fields not attacked: {json.dumps(unprobed)}"
+                )
+                if (
+                    attacked
+                    and outcome is not None
+                    and outcome.argument_path not in paths
+                ):
+                    lines.append(
+                        "      exact attempted path: "
+                        f"{json.dumps(outcome.argument_path)} "
+                        "(outside enumeration or tool-level call)"
+                    )
+                lines.extend(
+                    f"      unresolved {json.dumps(gap.path)}: {gap.reason}"
+                    for gap in tool.unresolved
+                )
+    elif dynamic:
+        lines.append("Runtime discovery coverage: unavailable")
+    lines.extend(("", "Review activity by stage"))
+    for name in ("static", "dynamic"):
+        activity = getattr(report.review_activity, name)
+        if activity is None:
+            lines.append(f"  {name}: unavailable historical activity")
+            continue
+        lines.append(
+            f"  {name}: {activity.state}; candidates {activity.candidate_count}, "
+            f"excluded {activity.excluded_count}, selected {activity.selected_count}, "
+            f"reviewed {activity.reviewed_count}, "
+            f"unreviewed {activity.unreviewed_count}; "
+            f"modes {', '.join(activity.modes) or 'none'}"
+        )
+        lines.append(f"    {activity.reason}")
+    return lines

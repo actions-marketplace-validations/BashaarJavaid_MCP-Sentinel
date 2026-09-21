@@ -6,6 +6,7 @@ import json
 import threading
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,8 +18,12 @@ import httpx
 import openai
 import pytest
 
-from scripts.capture_gpt_reviews import _planned_batches, _reserved_micro_usd
-from sentinel.config import LlmConfig, ReasoningEffort, load_configuration
+from scripts.capture_gpt_reviews import (
+    _planned_batches,
+    _reserved_micro_usd,
+    historical_eval_findings,
+)
+from sentinel.config import LlmConfig, ReasoningEffort
 from sentinel.finding import (
     CompletedReview,
     DynamicEvidence,
@@ -36,12 +41,107 @@ from sentinel.llm.context import (
     build_finding_context,
     sanitize_text,
 )
-from sentinel.llm.semantic_reviewer import OpenAITransport, SemanticReviewer, _classify
+from sentinel.llm.schema import FindingReviewDecision
+from sentinel.llm.semantic_reviewer import (
+    OpenAITransport,
+    SemanticReviewer,
+    _classify,
+    _probe_schema_eligible,
+    _ReviewFailure,
+    _validate_probe_plan,
+)
 from sentinel.llm.tools import extract_tool_catalog
-from sentinel.static.engine import run_static_scan
+from sentinel.orchestrator import _review_activity
 
 ROOT = Path(__file__).parent / "fixtures" / "gpt_review_eval"
 NOW = datetime(2026, 7, 18, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    ("field_schema", "string", "container"),
+    [
+        ({"type": "string"}, True, True),
+        ({"anyOf": [{"type": "string"}, {"type": "null"}]}, True, True),
+        ({"type": ["string", "null"]}, True, True),
+        (
+            {"anyOf": [{"type": "null"}, {"anyOf": [{"type": "string"}]}]},
+            True,
+            True,
+        ),
+        ({"anyOf": [{"type": "array"}, {"type": "null"}]}, False, True),
+        ({"anyOf": [{"type": "object"}, {"type": "null"}]}, False, True),
+        ({"anyOf": [{"type": "integer"}, {"type": "null"}]}, False, False),
+        ({}, False, False),
+        ({"anyOf": "string"}, False, False),
+        ({"type": [None, {}]}, False, False),
+    ],
+)
+def test_probe_plan_union_field_types(
+    field_schema: dict[str, Any], string: bool, container: bool
+) -> None:
+    batches, _ = _planned_batches("eval-medium", ReasoningEffort.MEDIUM)
+    original = next(c for b in batches for c in b.candidates if c.tool is not None)
+    assert original.tool is not None
+    tool = original.tool.model_copy(
+        update={
+            "input_schema": {
+                "type": "object",
+                "properties": {"anchor": {"type": "string"}, "value": field_schema},
+                "required": ["anchor"],
+            }
+        }
+    )
+    candidate = replace(original, tool=tool)
+    for probe, allowed in (("SENT-010", string), ("SENT-009", container)):
+        decision = FindingReviewDecision.model_validate_json(
+            json.dumps(
+                {
+                    "finding_id": str(original.finding.finding_id),
+                    "status": "confirmed",
+                    "confidence": 0.9,
+                    "reasoning": "Offline probe binding regression.",
+                    "evidence_refs": [
+                        {
+                            "path": "server.py",
+                            "start_line": 1,
+                            "end_line": 1,
+                            "claim": "Test context.",
+                        }
+                    ],
+                    "suggested_severity_override": None,
+                    "probe_plan": {
+                        "target_tool": tool.name,
+                        "ordered_probe_ids": [
+                            "SENT-008",
+                            "SENT-009",
+                            "SENT-010",
+                            "SENT-011",
+                        ],
+                        "argument_bindings": [
+                            {
+                                "probe_id": key,
+                                "field": "value" if key == probe else "anchor",
+                                "value": value,
+                            }
+                            for key, value in (
+                                ("SENT-009", "__SENTINEL_OVERSIZED__"),
+                                ("SENT-010", "__SENTINEL_INJECTION__"),
+                                ("SENT-011", "__SENTINEL_WRONG_TYPE__"),
+                            )
+                        ],
+                    },
+                }
+            )
+        )
+        if allowed:
+            _validate_probe_plan(decision, candidate)
+        else:
+            with pytest.raises(_ReviewFailure, match="probe requires"):
+                _validate_probe_plan(decision, candidate)
+    nullable_only = tool.model_copy(
+        update={"input_schema": {"properties": {"value": field_schema}}}
+    )
+    assert _probe_schema_eligible(nullable_only) is string
 
 
 class FakeTransport:
@@ -150,8 +250,7 @@ class FakeTransport:
 
 @cache
 def _all_eval_findings() -> tuple[Finding, ...]:
-    configuration = load_configuration(ROOT, environ={}, static_only=True)
-    return run_static_scan(configuration, uuid4(), timestamp=NOW).findings
+    return historical_eval_findings()
 
 
 def _sent002_findings() -> tuple[Finding, ...]:
@@ -268,7 +367,10 @@ def test_live_review_merges_status_plan_usage_and_authority(tmp_path: Path) -> N
     assert outcome.fatal is False
     assert reviewed.status is FindingStatus.CONFIRMED
     assert reviewed.exploitability.value == "likely"
+    assert reviewed.review is not None
     assert reviewed.review.mode == "live"
+    activity = _review_activity((finding,), outcome)
+    assert activity.state == "completed" and activity.modes == ("live",)
     assert reviewed.review.probe_plan is not None
     assert reviewed.review.probe_plan.ordered_probe_ids[0] == "SENT-011"
     assert reviewed.review.probe_plan.argument_bindings["SENT-010"] == {
@@ -281,6 +383,7 @@ def test_live_review_merges_status_plan_usage_and_authority(tmp_path: Path) -> N
     assert outcome.summary.origin_cost_micro_usd == 1328
     assert outcome.summary.endpoint_mode.value == "openai"
     assert outcome.summary.pricing is not None
+    assert outcome.summary.pricing.as_of == "2026-09-04"
     assert outcome.summary.pricing.input_micro_usd_per_million == 4_000_000
     assert reviewed.review.requested_model == "gpt-5.6-sol"
     assert reviewed.review.returned_model == "gpt-5.6-sol-2026-07-18"
@@ -375,7 +478,10 @@ def test_cache_rebinds_new_runtime_finding_ids(tmp_path: Path) -> None:
         now=lambda: NOW,
     ).review((second,), allow_degraded=False)
     assert outcome.findings[0].finding_id == second.finding_id
+    assert outcome.findings[0].review is not None
     assert outcome.findings[0].review.mode == "cached"
+    activity = _review_activity((second,), outcome)
+    assert activity.state == "completed" and activity.modes == ("cached",)
     assert outcome.summary.current_usage.total_tokens == 0
     assert outcome.summary.origin_usage.total_tokens == 150
     assert unused.calls == 0
@@ -423,7 +529,10 @@ def test_replay_rebinds_ids_and_preserves_capture_provenance(tmp_path: Path) -> 
         now=lambda: datetime(2030, 1, 1, tzinfo=timezone.utc),
     ).review((second,), allow_degraded=False)
     review = outcome.findings[0].review
+    assert review is not None
     assert review.mode == "replay"
+    activity = _review_activity((second,), outcome)
+    assert activity.state == "completed" and activity.modes == ("replay",)
     assert review.reviewed_at == NOW
     assert review.applied_at == datetime(2030, 1, 1, tzinfo=timezone.utc)
     assert review.latency_ms == 123
@@ -446,6 +555,7 @@ def test_invalid_batch_is_atomic_and_fails_closed(tmp_path: Path) -> None:
     ).review((finding,), allow_degraded=False)
     assert outcome.fatal is True
     assert outcome.findings[0].status is FindingStatus.NEEDS_REVIEW
+    assert outcome.findings[0].review is not None
     assert outcome.findings[0].review.mode == "not_reviewed"
 
 
@@ -474,6 +584,7 @@ def test_suppressed_static_finding_can_use_fixed_probe_fallback(
 
     assert outcome.fatal is False
     assert outcome.findings[0].status is FindingStatus.SUPPRESSED
+    assert outcome.findings[0].review is not None
     assert outcome.findings[0].review.probe_plan is None
 
 
@@ -575,6 +686,7 @@ def test_refusal_can_only_become_explicit_degraded_review(tmp_path: Path) -> Non
         now=lambda: NOW,
     ).review((finding,), allow_degraded=True)
     assert outcome.fatal is False
+    assert outcome.findings[0].review is not None
     assert outcome.findings[0].review.mode == "degraded"
     assert outcome.findings[0].review.reviewed_at is None
     assert outcome.findings[0].review.applied_at == NOW
@@ -596,7 +708,13 @@ def test_finding_cap_keeps_overflow_visible_without_failure(tmp_path: Path) -> N
     assert outcome.fatal is False
     assert outcome.summary.selected_count == 1
     assert outcome.summary.overflow_count == 3
-    assert sum(item.review.mode == "degraded" for item in outcome.findings) == 3
+    assert (
+        sum(
+            item.review is not None and item.review.mode == "degraded"
+            for item in outcome.findings
+        )
+        == 3
+    )
     assert any(warning.code == "gpt_review_truncated" for warning in outcome.warnings)
 
 
@@ -642,7 +760,9 @@ def test_dynamic_candidate_uses_supplied_evidence_and_never_gets_probe_plan(
         request={"value": "__SENTINEL_INJECTION__"},
         response={"accepted": True},
     )
-    data = sample_finding.model_dump(mode="python", exclude={"severity"})
+    data = sample_finding.model_dump(
+        mode="python", exclude={"severity", "review_disagrees"}
+    )
     data.update(
         finding_id=uuid4(),
         dedup_key=make_dedup_key(("SENT-010", "tool", "probe")),
@@ -672,6 +792,7 @@ def test_dynamic_candidate_uses_supplied_evidence_and_never_gets_probe_plan(
     reviewed = outcome.findings[0]
     assert reviewed.status is FindingStatus.CONFIRMED
     assert reviewed.exploitability.value == "confirmed"
+    assert reviewed.review is not None
     assert reviewed.review.probe_plan is None
 
 
@@ -887,8 +1008,10 @@ def test_compatible_http_failures_are_fatal_or_explicitly_degraded(
         ).review((_sent002_findings()[0],), allow_degraded=True)
 
     assert fatal.fatal is True
+    assert fatal.findings[0].review is not None
     assert fatal.findings[0].review.mode == "not_reviewed"
     assert degraded.fatal is False
+    assert degraded.findings[0].review is not None
     assert degraded.findings[0].review.mode == "degraded"
     assert degraded.summary.batches[0].status == "failed"
     assert all(origin not in warning.message for warning in degraded.warnings)

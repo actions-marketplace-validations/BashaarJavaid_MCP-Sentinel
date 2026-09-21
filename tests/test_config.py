@@ -20,6 +20,44 @@ from sentinel.errors import UsageError
 from tests.conftest import make_target
 
 
+@pytest.mark.parametrize(
+    "setting,default", [("max_probe_attempts", 24), ("campaign_timeout_seconds", 120)]
+)
+def test_campaign_setting_precedence_and_offline_bypass(
+    tmp_path: Path, setting: str, default: int
+) -> None:
+    target = make_target(tmp_path / "target")
+    assert (
+        getattr(load_configuration(target, environ={}).scanner.sandbox, setting)
+        == default
+    )
+    config = target / "sentinel.toml"
+    config.write_text(f"[sandbox]\n{setting} = 2\n", encoding="utf-8")
+    assert getattr(load_configuration(target, environ={}).scanner.sandbox, setting) == 2
+    environment = {"SENTINEL_" + setting.upper(): "3"}
+    assert (
+        getattr(
+            load_configuration(target, environ=environment).scanner.sandbox, setting
+        )
+        == 3
+    )
+    loaded = load_configuration(
+        target, environ=environment, sandbox_cli_overrides={setting: 4}
+    )
+    assert getattr(loaded.scanner.sandbox, setting) == 4
+    for invalid in ("0", "-1", '"bad"', "true", "1.5"):
+        config.write_text(f"[sandbox]\n{setting} = {invalid}\n", encoding="utf-8")
+        with pytest.raises(UsageError):
+            load_configuration(target, environ={})
+        offline = load_configuration(
+            target,
+            environ={"SENTINEL_" + setting.upper(): "bad"},
+            cli_overrides={"rules_only": True},
+            sandbox_cli_overrides={setting: -1},
+        )
+        assert getattr(offline.scanner.sandbox, setting) == default
+
+
 def test_defaults_and_framework_metadata_are_loaded(target_root: Path) -> None:
     loaded = load_configuration(target_root, environ={})
     assert loaded.scanner.scanner.format is OutputFormat.CONSOLE
@@ -433,3 +471,90 @@ def test_python_version_inference_and_symlink_rejection(tmp_path: Path) -> None:
     os.symlink(target, link)
     with pytest.raises(UsageError, match="symbolic link"):
         load_configuration(link, environ={}, static_only=True)
+
+
+@pytest.mark.parametrize(
+    ("project", "environment", "cli", "expected"),
+    (
+        (False, None, None, False),
+        (True, None, None, True),
+        (False, "1", None, True),
+        (True, "0", None, False),
+        (False, "false", True, True),
+        (True, "true", False, False),
+    ),
+)
+def test_rules_only_precedence(
+    target_root: Path,
+    project: bool,
+    environment: str | None,
+    cli: bool | None,
+    expected: bool,
+) -> None:
+    (target_root / "sentinel.toml").write_text(
+        f"[scanner]\nrules_only = {str(project).lower()}\n", encoding="utf-8"
+    )
+    env = {} if environment is None else {"SENTINEL_RULES_ONLY": environment}
+    loaded = load_configuration(
+        target_root, environ=env, cli_overrides={"rules_only": cli}
+    )
+    assert loaded.scanner.scanner.rules_only is expected
+    assert loaded.static_only is expected
+    assert (loaded.target is None) is expected
+
+
+def test_rules_only_ignores_inactive_llm_configuration(target_root: Path) -> None:
+    (target_root / "sentinel.toml").write_text(
+        '[llm]\nmodel = 42\nbase_url = "invalid"\n', encoding="utf-8"
+    )
+    loaded = load_configuration(
+        target_root,
+        environ={
+            "SENTINEL_RULES_ONLY": "true",
+            "SENTINEL_LLM_TIMEOUT_SECONDS": "invalid",
+            "SENTINEL_LLM_CACHE_ENABLED": "invalid",
+            "SENTINEL_TRUST_LLM_ENDPOINT": "invalid",
+            "OPENAI_BASE_URL": "invalid",
+        },
+        llm_cli_overrides={"base_url": "invalid", "reasoning_effort": "invalid"},
+        trust_llm_endpoint=True,
+        target_launch_cmd="invalid | shell",
+    )
+    assert loaded.static_only
+    assert loaded.target is None
+    with pytest.raises(UsageError):
+        load_configuration(target_root, environ={}, static_only=True)
+
+
+@pytest.mark.parametrize(
+    "scanner",
+    (
+        "scanner = 42\n",
+        '[scanner]\nrules_only = "invalid"\n',
+        '[scanner]\nrules_only = true\nformat = "invalid"\n',
+    ),
+)
+def test_rules_only_rejects_malformed_scanner_configuration(
+    target_root: Path, scanner: str
+) -> None:
+    (target_root / "sentinel.toml").write_text(scanner, encoding="utf-8")
+    with pytest.raises(UsageError):
+        load_configuration(target_root, environ={})
+
+
+def test_rules_only_preserves_scanner_environment_precedence(target_root: Path) -> None:
+    (target_root / "sentinel.toml").write_text(
+        '[scanner]\nformat = "invalid"\n', encoding="utf-8"
+    )
+    configuration = load_configuration(
+        target_root, environ={"SENTINEL_RULES_ONLY": "true", "SENTINEL_FORMAT": "json"}
+    )
+    assert configuration.scanner.scanner.format is OutputFormat.JSON
+    with pytest.raises(UsageError, match="must be true, false, 1, or 0"):
+        load_configuration(target_root, environ={"SENTINEL_RULES_ONLY": "invalid"})
+
+
+def test_rules_only_cli_rejects_non_table_scanner(target_root: Path) -> None:
+    (target_root / "sentinel.toml").write_text("scanner = 42\n", encoding="utf-8")
+    with pytest.raises(UsageError):
+        load_configuration(target_root, environ={}, cli_overrides={"rules_only": True})
